@@ -1,0 +1,3 @@
+# lizard complexity/length whitelist (IEC 62304)
+# Structurally large/branchy by design; covered by review + tests.
+main

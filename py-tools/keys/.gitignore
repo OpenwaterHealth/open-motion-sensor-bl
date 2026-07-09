@@ -1,0 +1,4 @@
+# Never commit private key or AES key material
+ecdsa_private.pem
+aes128.bin
+*.bin

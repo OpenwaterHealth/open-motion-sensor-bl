@@ -1,0 +1,215 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:0abd99d5-1b07-4439-bf9b-181966544cd8",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-06-21T13:59:49Z",
+    "lifecycles": [
+      { "phase": "build" }
+    ],
+    "tools": [
+      { "vendor": "GNU / Arm", "name": "arm-none-eabi-gcc", "version": "13.3.1" },
+      { "vendor": "Kitware", "name": "CMake", "version": "4.2.1" },
+      { "vendor": "Ninja", "name": "ninja", "version": "1.x" },
+      { "vendor": "STMicroelectronics", "name": "X-CUBE-SBSFU (signing/key tools, ported)", "version": "2.8.0" }
+    ],
+    "authors": [
+      { "name": "Openwater", "email": "george@openwater.cc" }
+    ],
+    "supplier": {
+      "name": "Openwater",
+      "contact": [ { "email": "george@openwater.cc" } ]
+    },
+    "component": {
+      "type": "firmware",
+      "bom-ref": "openmotion-bl",
+      "name": "openmotion-bl",
+      "version": "8e1819b",
+      "description": "STM32H743 secure bootloader (SBSFU port): ECDSA-P256 + SHA-256 authenticated boot of the application slot, with USB DFU firmware install.",
+      "supplier": { "name": "Openwater / Duvitech" },
+      "licenses": [ { "license": { "name": "Proprietary" } } ],
+      "properties": [
+        { "name": "target:mcu", "value": "STM32H743VIHx (Cortex-M7)" },
+        { "name": "vcs:commit", "value": "8e1819b679f9aa021b741d330b0db0801dd7b0d9" },
+        { "name": "boot:crypto-scheme", "value": "SECBOOT_ECCDSA_WITH_AES128_CBC_SHA256" },
+        { "name": "boot:slot1", "value": "0x08020000 (512 KiB), execution 0x08020400" },
+        { "name": "boot:config", "value": "dev mode (SECBOOT_DISABLE_SECURITY_IPS) — RDP/WRP/PCROP/MPU isolation not enforced" }
+      ]
+    }
+  },
+  "components": [
+    {
+      "type": "framework",
+      "bom-ref": "x-cube-sbsfu",
+      "name": "X-CUBE-SBSFU (SBSFU framework)",
+      "version": "2.8.0",
+      "group": "STMicroelectronics",
+      "supplier": { "name": "STMicroelectronics" },
+      "publisher": "STMicroelectronics",
+      "description": "Secure Boot and Secure Firmware Update application framework (SBSFU App/Target). Root-of-trust orchestration around the Secure Engine. Ported from the IAR reference to GCC/CMake.",
+      "licenses": [ { "license": { "name": "STMicroelectronics SLA0044" } } ],
+      "purl": "pkg:generic/stmicroelectronics/x-cube-sbsfu@2.8.0",
+      "properties": [
+        { "name": "scope:note", "value": "Root of Trust framework; sources in SBSFU/App and SBSFU/Target" }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "stm32-secure-engine",
+      "name": "STM32 Secure Engine",
+      "version": "2.5.4",
+      "group": "STMicroelectronics",
+      "supplier": { "name": "STMicroelectronics" },
+      "publisher": "STMicroelectronics",
+      "description": "Isolated Secure Engine core (call-gate, key custody, firmware-image verification) compiled into SECoreBin and programmed in flash sector 0.",
+      "licenses": [ { "license": { "name": "STMicroelectronics SLA0044" } } ],
+      "purl": "pkg:generic/stmicroelectronics/stm32-secure-engine@2.5.4",
+      "properties": [
+        { "name": "deployment", "value": "SECoreBin (immutable, sector 0)" }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "stm32-cryptographic-lib",
+      "name": "STM32 Cryptographic Library (STM32H7)",
+      "version": "3.1.1",
+      "group": "STMicroelectronics",
+      "supplier": { "name": "STMicroelectronics" },
+      "publisher": "STMicroelectronics",
+      "description": "Pre-compiled cryptographic primitives (AES-128-CBC, ECDSA P-256, SHA-256) linked into SECoreBin.",
+      "licenses": [ { "license": { "name": "STMicroelectronics SLA0048" } } ],
+      "purl": "pkg:generic/stmicroelectronics/stm32-cryptographic@3.1.1?arch=cortex-m7&toolchain=gcc",
+      "properties": [
+        { "name": "artifact", "value": "libSTM32CryptographicV3.1.1_STM32H7_GCC.a" }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "stm32h7xx-hal-driver",
+      "name": "STM32H7xx HAL Driver",
+      "version": "1.11.6",
+      "group": "STMicroelectronics",
+      "supplier": { "name": "STMicroelectronics" },
+      "publisher": "STMicroelectronics",
+      "description": "STM32H7 Hardware Abstraction Layer (HAL/LL drivers).",
+      "licenses": [ { "license": { "id": "BSD-3-Clause" } } ],
+      "purl": "pkg:generic/stmicroelectronics/stm32h7xx-hal-driver@1.11.6"
+    },
+    {
+      "type": "library",
+      "bom-ref": "cmsis-device-stm32h7xx",
+      "name": "CMSIS Device STM32H7xx",
+      "version": "1.10.7",
+      "group": "STMicroelectronics",
+      "supplier": { "name": "STMicroelectronics" },
+      "publisher": "STMicroelectronics",
+      "description": "CMSIS device headers, startup and system files for STM32H7xx.",
+      "licenses": [ { "license": { "id": "Apache-2.0" } } ],
+      "purl": "pkg:generic/stmicroelectronics/cmsis-device-stm32h7xx@1.10.7"
+    },
+    {
+      "type": "library",
+      "bom-ref": "cmsis-core-cm7",
+      "name": "CMSIS Core (Cortex-M)",
+      "version": "5.6.0",
+      "group": "Arm",
+      "supplier": { "name": "Arm Limited" },
+      "publisher": "Arm Limited",
+      "description": "CMSIS-Core (M) processor abstraction for Cortex-M7.",
+      "licenses": [ { "license": { "id": "Apache-2.0" } } ],
+      "purl": "pkg:generic/arm/cmsis-core@5.6.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "stm32-usb-device-library",
+      "name": "STM32 USB Device Library (DFU class)",
+      "version": "unspecified",
+      "group": "STMicroelectronics",
+      "supplier": { "name": "STMicroelectronics" },
+      "publisher": "STMicroelectronics",
+      "description": "USB device stack; DFU class used for the firmware-install interface. Bundled with X-CUBE-SBSFU 2.8.0; no version macro present in the source tree.",
+      "licenses": [ { "license": { "name": "STMicroelectronics SLA0044" } } ],
+      "purl": "pkg:generic/stmicroelectronics/stm32-usb-device-library",
+      "properties": [
+        { "name": "version:source", "value": "unversioned in-tree; ships with X-CUBE-SBSFU 2.8.0" },
+        { "name": "class", "value": "DFU" }
+      ]
+    },
+    {
+      "type": "application",
+      "bom-ref": "py-cryptography",
+      "name": "cryptography",
+      "version": "41.0.7",
+      "group": "PyCA",
+      "supplier": { "name": "Python Cryptographic Authority" },
+      "scope": "excluded",
+      "description": "Off-device firmware signing tool (ECDSA P-256 / AES / SHA-256). Not part of the on-device image.",
+      "licenses": [ { "expression": "Apache-2.0 OR BSD-3-Clause" } ],
+      "purl": "pkg:pypi/cryptography@41.0.7",
+      "properties": [ { "name": "deployment", "value": "host build/sign tooling" } ]
+    },
+    {
+      "type": "application",
+      "bom-ref": "py-pyusb",
+      "name": "pyusb",
+      "version": "1.3.1",
+      "group": "PyUSB",
+      "supplier": { "name": "PyUSB" },
+      "scope": "excluded",
+      "description": "Off-device pure-Python USB DFU flasher backend. Not part of the on-device image.",
+      "licenses": [ { "license": { "id": "BSD-3-Clause" } } ],
+      "purl": "pkg:pypi/pyusb@1.3.1",
+      "properties": [ { "name": "deployment", "value": "host flash tooling" } ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "libusb",
+      "name": "libusb",
+      "version": "1.0",
+      "group": "libusb",
+      "supplier": { "name": "libusb project" },
+      "scope": "excluded",
+      "description": "Host USB backend used by pyusb / dfu-util. Not part of the on-device image.",
+      "licenses": [ { "license": { "id": "LGPL-2.1-or-later" } } ],
+      "purl": "pkg:generic/libusb/libusb@1.0",
+      "properties": [ { "name": "deployment", "value": "host flash tooling" } ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "openmotion-bl",
+      "dependsOn": [
+        "x-cube-sbsfu",
+        "stm32-secure-engine",
+        "stm32-cryptographic-lib",
+        "stm32h7xx-hal-driver",
+        "cmsis-device-stm32h7xx",
+        "cmsis-core-cm7",
+        "stm32-usb-device-library"
+      ]
+    },
+    {
+      "ref": "x-cube-sbsfu",
+      "dependsOn": [ "stm32-secure-engine", "stm32h7xx-hal-driver" ]
+    },
+    {
+      "ref": "stm32-secure-engine",
+      "dependsOn": [ "stm32-cryptographic-lib" ]
+    },
+    {
+      "ref": "stm32-usb-device-library",
+      "dependsOn": [ "stm32h7xx-hal-driver" ]
+    },
+    {
+      "ref": "stm32h7xx-hal-driver",
+      "dependsOn": [ "cmsis-device-stm32h7xx" ]
+    },
+    {
+      "ref": "cmsis-device-stm32h7xx",
+      "dependsOn": [ "cmsis-core-cm7" ]
+    },
+    { "ref": "stm32-cryptographic-lib", "dependsOn": [] },
+    { "ref": "cmsis-core-cm7", "dependsOn": [] }
+  ]
+}

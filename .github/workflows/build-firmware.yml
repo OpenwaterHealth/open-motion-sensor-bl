@@ -1,0 +1,184 @@
+name: Build bootloader
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ "main", "next" ]
+    tags:
+      - "*.*.*"
+      - "*.*.*-rc.*"
+      - "*.*.*-dev.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # ---------------------------
+      # Determine build config from the ref:
+      #   *-dev.* tag            -> Debug   (development pre-release)
+      #   *-rc.* / X.Y.Z tag     -> Release (release candidate / final release)
+      #   branch push / dispatch -> Debug
+      # ---------------------------
+      - name: Determine build config
+        id: cfg
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
+            TAG_NAME=$(python3 -c "import json;print(json.load(open('$GITHUB_EVENT_PATH'))['release']['tag_name'])")
+            IS_TAG=1
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG_NAME="$GITHUB_REF_NAME"; IS_TAG=1
+          else
+            TAG_NAME="$GITHUB_REF_NAME"; IS_TAG=0
+          fi
+          if [ "$IS_TAG" = "1" ] && [[ "$TAG_NAME" != *-dev.* ]]; then
+            CONFIG=Release
+          else
+            CONFIG=Debug
+          fi
+          echo "config=$CONFIG" >> "$GITHUB_OUTPUT"
+          echo "ref='$GITHUB_REF' event='$GITHUB_EVENT_NAME' tag='$TAG_NAME' -> build config: $CONFIG"
+
+      # Regenerate the SECoreBin key file from key material kept OUT of git:
+      #   - AES-128 key  : from the SECOREBIN_AES_KEY secret (base64 of the 16 raw bytes)
+      #   - ECC pub key  : derived from the committed py-tools/keys/ecdsa_public.pem
+      # se_key.s embeds the AES secret, so it is .gitignored and produced here at
+      # build time. The ECDSA *private* signing key is NOT needed to build the BL.
+      - name: Regenerate se_key.s from key material
+        env:
+          SECOREBIN_AES_KEY: ${{ secrets.SECOREBIN_AES_KEY }}
+        run: |
+          if [ -z "$SECOREBIN_AES_KEY" ]; then
+            echo "::error::SECOREBIN_AES_KEY secret is not set — cannot build SECoreBin." >&2
+            exit 1
+          fi
+          python3 -m pip install --quiet --disable-pip-version-check cryptography
+          # AES key (secret) -> raw 16 bytes
+          printf '%s' "$SECOREBIN_AES_KEY" | base64 -d > "$RUNNER_TEMP/aes128.bin"
+          if [ "$(wc -c < "$RUNNER_TEMP/aes128.bin")" -ne 16 ]; then
+            echo "::error::Decoded AES key is not 16 bytes — check the SECOREBIN_AES_KEY secret." >&2
+            exit 1
+          fi
+          # Public key X/Y (32 bytes each) from the committed public PEM
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import sys
+          from cryptography.hazmat.primitives import serialization
+          tmp = sys.argv[1]
+          pub = serialization.load_pem_public_key(open("py-tools/keys/ecdsa_public.pem", "rb").read())
+          n = pub.public_numbers()
+          open(f"{tmp}/pub_x.bin", "wb").write(n.x.to_bytes(32, "big"))
+          open(f"{tmp}/pub_y.bin", "wb").write(n.y.to_bytes(32, "big"))
+          PY
+          python3 py-tools/gen_se_key_s.py \
+            --aes-key   "$RUNNER_TEMP/aes128.bin" \
+            --pub-key-x "$RUNNER_TEMP/pub_x.bin" \
+            --pub-key-y "$RUNNER_TEMP/pub_y.bin"
+          rm -f "$RUNNER_TEMP/aes128.bin"
+          test -s SECoreBin/Startup/se_key.s && echo "se_key.s regenerated."
+
+      - name: Pull build image
+        run: docker pull ghcr.io/openwaterhealth/stm32-build-env:latest
+
+      - name: Build inside container
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/workspace \
+            -w /workspace \
+            ghcr.io/openwaterhealth/stm32-build-env:latest \
+            bash -lc "git config --global --add safe.directory /workspace && cmake --preset ${{ steps.cfg.outputs.config }} && cmake --build build/${{ steps.cfg.outputs.config }} --config ${{ steps.cfg.outputs.config }} --target all -j 10"
+
+      # Guard: the objcopy POST_BUILD step must have produced both the .bin and
+      # .hex (not just the .elf). Fail loudly here rather than shipping an
+      # incomplete artifact that silently lacks the flashable images.
+      - name: Verify build outputs (.bin/.hex/.elf)
+        run: |
+          OUT="build/${{ steps.cfg.outputs.config }}"
+          echo "Contents of $OUT:"; ls -la "$OUT" || true
+          missing=0
+          for f in openmotion-bl.bin openmotion-bl.hex openmotion-bl.elf; do
+            if [ ! -s "$OUT/$f" ]; then
+              echo "::error::Expected build output missing or empty: $OUT/$f" >&2
+              missing=1
+            else
+              echo "OK: $OUT/$f ($(wc -c < "$OUT/$f") bytes)"
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openmotion-bl-${{ steps.cfg.outputs.config }}
+          path: |
+            build/${{ steps.cfg.outputs.config }}/*.hex
+            build/${{ steps.cfg.outputs.config }}/*.bin
+            build/${{ steps.cfg.outputs.config }}/*.elf
+
+      - name: Detect release type
+        id: reltype
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+
+          if [[ "$TAG_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(rc|dev)\.[0-9]+$ ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$TAG_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unrecognized tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+
+      - name: Capture build metadata
+        id: buildmeta
+        run: |
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "datetime=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          : > notes.md
+
+          if [[ "${{ steps.reltype.outputs.prerelease }}" == "true" ]]; then
+            echo "⚠️ **PRE-RELEASE – NOT FOR PRODUCTION**" >> notes.md
+            echo "" >> notes.md
+          fi
+
+          PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${GITHUB_REF_NAME}$" | head -n 1)
+
+          if [ -z "$PREV_TAG" ]; then
+            git log --pretty=format:"- %s" >> notes.md
+          else
+            git log "$PREV_TAG"..HEAD --pretty=format:"- %s" >> notes.md
+          fi
+
+          echo "" >> notes.md
+          echo "" >> notes.md
+          echo "---" >> notes.md
+          echo "**Build SHA:** \`${{ steps.buildmeta.outputs.sha }}\`" >> notes.md
+          echo "**Build Time:** ${{ steps.buildmeta.outputs.datetime }}" >> notes.md
+          echo "**Build Config:** ${{ steps.cfg.outputs.config }}" >> notes.md
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          prerelease: ${{ steps.reltype.outputs.prerelease }}
+          body_path: notes.md
+          overwrite_files: true
+          make_latest: ${{ steps.reltype.outputs.prerelease == 'false' }}
+          files: |
+            build/${{ steps.cfg.outputs.config }}/*.hex
+            build/${{ steps.cfg.outputs.config }}/*.bin
