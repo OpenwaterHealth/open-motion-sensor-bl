@@ -87,7 +87,7 @@ static uint16_t s_current_fw_version = 0U;  /* installed FwVersion at DFU entry 
  * The DFU writable window is clamped to the SBSFU active slot
  * (SLOT_ACTIVE_1: 0x08020000-0x0809FFFF, see Linker/mapping_fwimg.ld) so that
  * ALL DFU-writable flash is covered by secure-boot slot verification. Everything
- * else — bootloader (sector 0), the anti-rollback floor (sector 14, 0x081C0000)
+ * else — bootloader (sector 0), the anti-rollback floor (sector 9, 0x08120000)
  * and user config (sector 15, 0x081E0000) — is read-only over DFU. */
 #define FLASH_DESC_STR      "@Internal Flash/0x08000000/01*128Ka,04*128Kg,11*128Ka"
 

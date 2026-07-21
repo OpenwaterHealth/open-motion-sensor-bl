@@ -27,7 +27,22 @@ secure-boot core, but a different board bring-up and a **distinct signing key**.
 |---|---|---|
 | Bootloader | `0x08000000` (sector 0) | this image |
 | Application slot | `0x08020000`–`0x0809FFFF` (512 KB) | DFU-writable; app vectors at `0x08020400` |
-| Reserved / anti-rollback / config | `>= 0x080A0000` | read-only over DFU |
+| Application slot 2 | `0x080A0000`–`0x0811FFFF` (512 KB) | spare, reserved for future dual-slot |
+| Anti-rollback floor | `0x08120000` (sector 9) | bootloader-managed; erased/rewritten by this image |
+| Reserved | `0x08140000`–`0x0819FFFF` (384 KB) | unallocated |
+| Application-owned | `0x081A0000`–`0x081DFFFF` (256 KB) | sensor camera FPGA bitstream — **never written by the bootloader** |
+| User config | `0x081E0000` (sector 15) | application-managed |
+
+Everything outside the application slot is read-only over DFU. Full map with the
+reasoning behind each boundary: [`Core/Inc/memory_map.h`](Core/Inc/memory_map.h).
+
+> **Note:** the anti-rollback floor lives at the *bottom* of the reserved band
+> deliberately. The top of that band (`0x081A0000`+) is application-owned — on the
+> sensor it holds the camera FPGA bitstream — so bootloader-managed regions must
+> grow upward from sector 9, never downward from sector 14. This is the one place
+> the sensor and console bootloader flash maps intentionally differ:
+> `open-motion-console-bl` keeps its floor at `0x081C0000`, which is free on that
+> board.
 
 ## Sensor-board bring-up (differs from the console board)
 

@@ -11,7 +11,9 @@
  *   sector 0      0x08000000  128K  bootloader
  *   sectors 1-4   0x08020000  512K  APP SLOT 1 (active)   <-- this file
  *   sectors 5-8   0x080A0000  512K  APP SLOT 2 (reserved/future dual-slot)
- *   sectors 9-14  0x08120000  768K  reserved (future use)
+ *   sector 9      0x08120000  128K  anti-rollback floor (bootloader)
+ *   sectors 10-12 0x08140000  384K  reserved (future use)
+ *   sectors 13-14 0x081A0000  256K  application-owned (sensor: FPGA bitstream)
  *   sector 15     0x081E0000  128K  user config (read-only) */
 
 /* Active slot #1: sectors 1-4 = 4 x 128KB = 512KB */
