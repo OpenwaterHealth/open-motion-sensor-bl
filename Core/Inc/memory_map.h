@@ -16,22 +16,41 @@
   *
   *   Addr range              Size   Sct   Region            Access (via DFU)
   *  ---------------------------------------------------------------------------
-  *  0x08000000-0x0801FFFF    128K   0     BOOTLOADER         read-only
-  *  0x08020000-0x0809FFFF    512K   1-4   APP SLOT 1 (active) read/erase/write
-  *  0x080A0000-0x0811FFFF    512K   5-8   APP SLOT 2 (spare)  read/erase/write
-  *  0x08120000-0x081DFFFF    768K   9-14  RESERVED (future)   read/erase/write
+  *  0x08000000-0x0801FFFF    128K   0     BOOTLOADER          read-only
+  *  0x08020000-0x0809FFFF    512K   1-4   APP SLOT (active)   read/erase/write
+  *  0x080A0000-0x080BFFFF    128K   5     ANTI-ROLLBACK FLOOR read-only
+  *  0x080C0000-0x0819FFFF    896K   6-12  RESERVED (future)   read-only
+  *  0x081A0000-0x081DFFFF    256K   13-14 APPLICATION-OWNED   read-only
   *  0x081E0000-0x081FFFFF    128K   15    USER CONFIG         read-only
   *  ---------------------------------------------------------------------------
   *                          2048K
   *
+  *  The layout is ordered by owner: bootloader-managed flash occupies the bottom
+  *  (sectors 0-5, contiguous with the bootloader itself), application-managed
+  *  flash the top (13-15), with the unallocated run between them. Anything the
+  *  BOOTLOADER claims in future must be taken from sector 6 upward, so it grows
+  *  away from application-owned flash rather than into it.
+  *
   *  Notes:
-  *   - The BOOTLOADER sector and the USER CONFIG sector are NOT writable or
-  *     erasable through the DFU interface. The bootloader may READ user config.
-  *   - The bootloader currently boots APP SLOT 1. SLOT 2 is reserved for a
-  *     future dual-slot / A-B update scheme and is not yet referenced by SBSFU.
-  *   - Inside a slot the first @ref MEM_APP_IMAGE_OFFSET bytes hold the signed
+  *   - Only the APP SLOT is writable or erasable through the DFU interface; the
+  *     window is deliberately clamped to it so that ALL DFU-writable flash is
+  *     covered by secure-boot slot verification. Everything else is read-only
+  *     over DFU. The bootloader may READ user config.
+  *   - SBSFU is configured single-image (SFU_NB_MAX_ACTIVE_IMAGE == 1). There is
+  *     no second slot and no A/B scheme: dual-slot was deliberately removed so
+  *     that all openmotion bootloaders share one layout. Linker/mapping_fwimg.ld
+  *     zeroes SLOT_Active_2 and _3 accordingly.
+  *   - Inside the slot the first @ref MEM_APP_IMAGE_OFFSET bytes hold the signed
   *     image header; the application is linked to run at SLOT_START + that offset.
-  *   - RESERVED is unallocated flash kept free for future features.
+  *   - ANTI-ROLLBACK FLOOR is bootloader-managed (SBSFU/Target/Src/anti_rollback.c).
+  *     It is erased and rewritten by the bootloader, so nothing else may live in
+  *     that sector. It sits immediately above the DFU writable window, so DFU can
+  *     never reach it.
+  *   - APPLICATION-OWNED is flash the *application* writes and the bootloader must
+  *     never touch. On the sensor module this holds the camera FPGA bitstream
+  *     (~160 KB at 0x081A0000, spanning sectors 13-14), which the application
+  *     streams to the CrossLink on every boot. Read-only here means read-only via
+  *     DFU; the application manages it through its own path.
   *
   ******************************************************************************
   */
@@ -55,15 +74,28 @@
 #define MEM_SLOT1_SIZE            (0x00080000UL)   /* 512 KB                      */
 #define MEM_SLOT1_END             (MEM_SLOT1_BASE + MEM_SLOT1_SIZE)
 
-/* ── Application slot 2 — spare/future (sectors 5-8, 512 KB) ───────────────── */
-#define MEM_SLOT2_BASE            (0x080A0000UL)
-#define MEM_SLOT2_SIZE            (0x00080000UL)   /* 512 KB                      */
-#define MEM_SLOT2_END             (MEM_SLOT2_BASE + MEM_SLOT2_SIZE)
+/* ── Anti-rollback floor (sector 5, bootloader-managed) ───────────────────── */
+/* Append-only monotonic firmware-version log. Erased and rewritten by the
+   bootloader (SBSFU/Target/Src/anti_rollback.c), so it must not overlap anything
+   the application owns. Placed immediately above the slot — i.e. the first sector
+   DFU cannot reach — keeping bootloader-managed flash contiguous at the bottom
+   and leaving the top of flash to the application. */
+#define MEM_ANTIROLLBACK_BASE     (0x080A0000UL)
+#define MEM_ANTIROLLBACK_SIZE     (0x00020000UL)   /* 128 KB                      */
+#define MEM_ANTIROLLBACK_END      (MEM_ANTIROLLBACK_BASE + MEM_ANTIROLLBACK_SIZE)
 
-/* ── Reserved for future use (sectors 9-14, 768 KB) ───────────────────────── */
-#define MEM_RESERVED_BASE         (0x08120000UL)
-#define MEM_RESERVED_SIZE         (0x000C0000UL)   /* 768 KB                      */
+/* ── Reserved for future use (sectors 6-12, 896 KB) ───────────────────────── */
+#define MEM_RESERVED_BASE         (0x080C0000UL)
+#define MEM_RESERVED_SIZE         (0x000E0000UL)   /* 896 KB                      */
 #define MEM_RESERVED_END          (MEM_RESERVED_BASE + MEM_RESERVED_SIZE)
+
+/* ── Application-owned (sectors 13-14, 256 KB) ────────────────────────────── */
+/* Written by the APPLICATION, never by the bootloader. On the sensor module this
+   is the camera FPGA bitstream at 0x081A0000 (~160 KB, spanning both sectors).
+   Placing bootloader data here corrupts it — see issue #1. */
+#define MEM_APP_OWNED_BASE        (0x081A0000UL)
+#define MEM_APP_OWNED_SIZE        (0x00040000UL)   /* 256 KB                      */
+#define MEM_APP_OWNED_END         (MEM_APP_OWNED_BASE + MEM_APP_OWNED_SIZE)
 
 /* ── User configuration (sector 15, read-only, not erasable via DFU) ──────── */
 #define MEM_USER_CONFIG_BASE      (0x081E0000UL)
@@ -79,11 +111,18 @@
 /* Address the active application is linked to / executes from. */
 #define MEM_APP_RUN_ADDRESS       (MEM_SLOT1_BASE + MEM_APP_IMAGE_OFFSET) /* 0x08020400 */
 
-/* ── DFU writable window (everything except bootloader + user config) ─────── */
-/* The DFU interface accepts erase/write only within [BASE, END). Both the
-   bootloader sector (below BASE) and the user-config sector (at END) are
-   excluded, making them effectively read-only over DFU. */
-#define MEM_DFU_WRITABLE_BASE     (MEM_SLOT1_BASE)        /* 0x08020000 */
-#define MEM_DFU_WRITABLE_END      (MEM_USER_CONFIG_BASE)  /* 0x081E0000 (exclusive) */
+/* ── DFU writable window (the active application slot ONLY) ───────────────── */
+/* The DFU interface accepts erase/write only within [BASE, END) — the active
+   slot and nothing else, so that all DFU-writable flash is covered by secure-boot
+   slot verification. Everything below BASE (the bootloader) and everything at or
+   above END (the anti-rollback floor, reserved, application-owned, and
+   user config) is read-only over DFU.
+
+   These must match APP_FLASH_BASE / FLASH_END_ADDR in USB_DEVICE/App/usbd_dfu_if.c,
+   which is where the bound is actually enforced. MEM_DFU_WRITABLE_END previously
+   read 0x081E0000 here while the enforced value was 0x080A0000; the enforced
+   (narrower) value is correct and this is now aligned to it. */
+#define MEM_DFU_WRITABLE_BASE     (MEM_SLOT1_BASE)  /* 0x08020000 */
+#define MEM_DFU_WRITABLE_END      (MEM_SLOT1_END)   /* 0x080A0000 (exclusive) */
 
 #endif /* MEMORY_MAP_H */

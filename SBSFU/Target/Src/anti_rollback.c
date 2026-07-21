@@ -3,10 +3,22 @@
   * @file    anti_rollback.c
   * @brief   Persistent monotonic firmware anti-rollback floor (flash-backed).
   *
-  * Storage: an append-only log of version entries in flash sector 6 of bank 2
-  * (0x081C0000, 128 KB). This sector sits at/above the bootloader's DFU writable
-  * window end (FLASH_END_ADDR in usbd_dfu_if.c), so a firmware update over USB
-  * DFU cannot erase or overwrite it.
+  * Storage: an append-only log of version entries in flash sector 5 of bank 1
+  * (MEM_ANTIROLLBACK_BASE, 0x080A0000, 128 KB) — the first sector above the
+  * application slot, i.e. the first address the DFU writable window cannot reach
+  * (FLASH_END_ADDR in usbd_dfu_if.c), so a firmware update over USB DFU cannot
+  * erase or overwrite it.
+  *
+  * It must also stay clear of whatever the APPLICATION puts in flash. The sensor
+  * application owns 0x081A0000-0x081DFFFF for the camera FPGA bitstream and
+  * sector 15 for its config, so bootloader-managed flash is kept contiguous at
+  * the BOTTOM and grows upward, away from the application. See
+  * Core/Inc/memory_map.h and issue #1.
+  *
+  * Note this erases/programs a sector in bank 1 while the bootloader executes
+  * from bank 1 sector 0. That is already the norm here — SBSFU erases the
+  * application slot (also bank 1) during every DFU download — so no
+  * read-while-write accommodation is needed beyond what already exists.
   *
   * Each log entry is one STM32H7 flash word (32 bytes = 256 bits, the minimum
   * programmable unit, programmable once after erase):
@@ -27,13 +39,16 @@
 
 #include "main.h"          /* HAL (flash) */
 #include "anti_rollback.h"
+#include "memory_map.h"    /* MEM_ANTIROLLBACK_* — the flash map is authoritative */
 
-/* Flash sector 6 of bank 2. MUST stay outside the DFU writable window
- * (usbd_dfu_if.c: APP_FLASH_BASE .. FLASH_END_ADDR) so DFU cannot erase it. */
-#define AR_SECTOR_BASE      0x081C0000UL
-#define AR_SECTOR_SIZE      0x00020000UL      /* 128 KB */
-#define AR_BANK             FLASH_BANK_2
-#define AR_SECTOR_INDEX     6U                 /* sector 6 within bank 2 */
+/* Flash sector 5 of bank 1 (flat sector 5). Two constraints, both load-bearing:
+ *   1. MUST stay outside the DFU writable window (usbd_dfu_if.c:
+ *      APP_FLASH_BASE .. FLASH_END_ADDR) so DFU cannot erase it.
+ *   2. MUST NOT collide with application-owned flash — see memory_map.h. */
+#define AR_SECTOR_BASE      MEM_ANTIROLLBACK_BASE   /* 0x080A0000 */
+#define AR_SECTOR_SIZE      MEM_ANTIROLLBACK_SIZE   /* 128 KB */
+#define AR_BANK             FLASH_BANK_1
+#define AR_SECTOR_INDEX     5U                      /* sector 5 within bank 1 */
 
 #define AR_ENTRY_SIZE       32U                /* one STM32H7 flash word (bytes) */
 #define AR_WORDS_PER_ENTRY  (AR_ENTRY_SIZE / 4U)
@@ -80,7 +95,7 @@ static void ar_scan(uint32_t *p_floor, uint32_t *p_free_idx)
 }
 
 /**
-  * @brief  Erase the floor sector (sector 6, bank 2).
+  * @brief  Erase the floor sector (sector 5, bank 1).
   */
 static void ar_erase_sector(void)
 {

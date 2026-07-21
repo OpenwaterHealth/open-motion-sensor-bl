@@ -331,18 +331,22 @@ Addr range              Size   Sct   Region            DFU access
   0x08000000  ISR vectors
   0x08000400  SE CallGate + SECoreBin
   0x08008A00  SBSFU code
-0x08020000-0x0809FFFF   512K   1-4   APP SLOT 1 (active) read/erase/write
+0x08020000-0x0809FFFF   512K   1-4   APP SLOT (active)   read/erase/write
   0x08020000    └ signed header (0x400)
   0x08020400    └ application firmware (execution address)
-0x080A0000-0x0811FFFF   512K   5-8   APP SLOT 2 (spare)  read/erase/write
-0x08120000-0x081DFFFF   768K   9-14  RESERVED (future)   read/erase/write
+0x080A0000-0x080BFFFF   128K   5     ANTI-ROLLBACK FLOOR read-only
+0x080C0000-0x0819FFFF   896K   6-12  RESERVED (future)   read-only
+0x081A0000-0x081DFFFF   256K   13-14 APPLICATION-OWNED   read-only
 0x081E0000-0x081FFFFF   128K   15    USER CONFIG         read-only
 0x08200000  End of flash
 ```
 
-> The bootloader sector and the USER CONFIG sector cannot be erased or written
-> over DFU (the bootloader may still *read* user config). SLOT 2 is reserved for
-> a future dual-slot / A-B update scheme; the bootloader currently boots SLOT 1.
+> Only the APP SLOT can be erased or written over DFU; everything else is
+> read-only through that path (the bootloader may still *read* user config).
+> There is no second slot — SBSFU is single-image and dual-slot / A-B updating
+> was deliberately removed so all openmotion bootloaders share one layout.
+> APPLICATION-OWNED is written by the application, never the bootloader; on the
+> sensor it holds the camera FPGA bitstream. See `Core/Inc/memory_map.h`.
 
 ---
 

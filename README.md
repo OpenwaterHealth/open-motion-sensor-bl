@@ -27,7 +27,28 @@ secure-boot core, but a different board bring-up and a **distinct signing key**.
 |---|---|---|
 | Bootloader | `0x08000000` (sector 0) | this image |
 | Application slot | `0x08020000`–`0x0809FFFF` (512 KB) | DFU-writable; app vectors at `0x08020400` |
-| Reserved / anti-rollback / config | `>= 0x080A0000` | read-only over DFU |
+| Anti-rollback floor | `0x080A0000` (sector 5) | bootloader-managed; erased/rewritten by this image |
+| Reserved | `0x080C0000`–`0x0819FFFF` (896 KB) | unallocated |
+| Application-owned | `0x081A0000`–`0x081DFFFF` (256 KB) | sensor camera FPGA bitstream — **never written by the bootloader** |
+| User config | `0x081E0000` (sector 15) | application-managed |
+
+Everything outside the application slot is read-only over DFU. Full map with the
+reasoning behind each boundary: [`Core/Inc/memory_map.h`](Core/Inc/memory_map.h).
+
+The map is ordered by owner: bootloader-managed flash at the bottom (sectors 0-5,
+contiguous with the bootloader), application-managed flash at the top (13-15), and
+the unallocated run in between. Anything the bootloader claims in future must be
+taken from sector 6 upward, so it grows away from application-owned flash rather
+than into it — the top of that band holds the sensor's camera FPGA bitstream.
+
+There is no second slot: SBSFU is single-image (`SFU_NB_MAX_ACTIVE_IMAGE == 1`)
+and dual-slot / A-B updating was deliberately removed so that all openmotion
+bootloaders share one layout.
+
+> **Note:** this is the one place the sensor and console bootloader flash maps
+> intentionally differ. `open-motion-console-bl` keeps its floor at `0x081C0000`,
+> which is free on that board (no FPGA bitstream), and moving it would reset the
+> stored floor on any already-converted console.
 
 ## Sensor-board bring-up (differs from the console board)
 
