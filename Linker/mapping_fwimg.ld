@@ -9,10 +9,9 @@
 /* Slots must be aligned on sector size (128KB on STM32H7).
  * See Core/Inc/memory_map.h for the full flash partition map. Layout:
  *   sector 0      0x08000000  128K  bootloader
- *   sectors 1-4   0x08020000  512K  APP SLOT 1 (active)   <-- this file
- *   sectors 5-8   0x080A0000  512K  APP SLOT 2 (reserved/future dual-slot)
- *   sector 9      0x08120000  128K  anti-rollback floor (bootloader)
- *   sectors 10-12 0x08140000  384K  reserved (future use)
+ *   sectors 1-4   0x08020000  512K  APP SLOT (active)     <-- this file
+ *   sector 5      0x080A0000  128K  anti-rollback floor (bootloader)
+ *   sectors 6-12  0x080C0000  896K  reserved (future use)
  *   sectors 13-14 0x081A0000  256K  application-owned (sensor: FPGA bitstream)
  *   sector 15     0x081E0000  128K  user config (read-only) */
 
@@ -21,10 +20,11 @@ __ICFEDIT_SLOT_Active_1_header__ = 0x08020000;
 __ICFEDIT_SLOT_Active_1_start__  = 0x08020000;
 __ICFEDIT_SLOT_Active_1_end__    = 0x0809FFFF;
 
-/* Slots 2 and 3 are not managed by SBSFU in this single-image configuration.
- * APP SLOT 2 (0x080A0000, 512KB) is physically reserved (see memory_map.h) for a
- * future dual-slot / A-B update scheme; enable it here and bump
- * SFU_NB_MAX_ACTIVE_IMAGE when that is implemented. */
+/* Slots 2 and 3 are unused: this is a single-image configuration
+ * (SFU_NB_MAX_ACTIVE_IMAGE == 1) and dual-slot / A-B updating was deliberately
+ * removed so that all openmotion bootloaders share one layout. The address space
+ * that a second slot would have occupied is plain reserved flash — see
+ * Core/Inc/memory_map.h. Do not reinstate it without revisiting that map. */
 __ICFEDIT_SLOT_Active_2_header__ = 0x00000000;
 __ICFEDIT_SLOT_Active_2_start__  = 0x00000000;
 __ICFEDIT_SLOT_Active_2_end__    = 0x00000000;

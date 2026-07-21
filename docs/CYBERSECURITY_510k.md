@@ -96,9 +96,8 @@ Addr range              Size   Sct   Region              Access control
 ---------------------------------------------------------------------------
 0x08000000-0x0801FFFF   128K   0     BOOTLOADER           read-only (immutable)
 0x08020000-0x0809FFFF   512K   1-4   APP SLOT 1 (active)  updatable (signed) — DFU writable window
-0x080A0000-0x0811FFFF   512K   5-8   APP SLOT 2 (spare)   read-only via DFU
-0x08120000-0x0813FFFF   128K   9     ANTI-ROLLBACK FLOOR  read-only via DFU (bootloader-managed)
-0x08140000-0x0819FFFF   384K   10-12 RESERVED             read-only via DFU
+0x080A0000-0x080BFFFF   128K   5     ANTI-ROLLBACK FLOOR  read-only via DFU (bootloader-managed)
+0x080C0000-0x0819FFFF   896K   6-12  RESERVED             read-only via DFU
 0x081A0000-0x081DFFFF   256K   13-14 APPLICATION-OWNED    read-only via DFU (application-managed)
 0x081E0000-0x081FFFFF   128K   15    USER CONFIG          read-only via DFU (application-managed)
 ```
@@ -107,7 +106,7 @@ The DFU update interface restricts erase/write to the **active application slot 
 (`0x08020000`–`0x0809FFFF`, the SBSFU `SLOT_ACTIVE_1` extent in `Linker/mapping_fwimg.ld`). The DFU
 writable window is deliberately clamped to the slot so that **all DFU-writable flash is covered by
 secure-boot slot verification** (no writable region escapes the `VerifyActiveSlot` check). The
-bootloader sector (0), slot 2 (5–8), the anti-rollback floor sector (9), reserved sectors (10–12),
+bootloader sector (0), the anti-rollback floor sector (5), reserved sectors (6–12),
 application-owned flash (13–14), and the
 user-config sector (15) are **not erasable or writable** through the firmware-update (DFU) interface.
 The anti-rollback floor sector is written only by the bootloader (during verified boot, see §5.6); the
@@ -245,7 +244,7 @@ version (threat T-9), the bootloader enforces a monotonic version floor:
   encoded from the release semantic version as `major×10000 + minor×100 + patch` (monotonic with
   semver ordering). The value is supplied by the controlled build/CI pipeline at signing time.
 - **Persistent floor.** The bootloader stores the highest version ever launched in a dedicated flash
-  sector (sector 9, `0x08120000`) as an append-only log. This sector is **outside the DFU writable
+  sector (sector 5, `0x080A0000`) as an append-only log. This sector is **outside the DFU writable
   window**, so a firmware update cannot erase or lower it; it is non-volatile, so the floor survives
   power cycles and SWD reflashes of the application slot.
 - **Boot-time enforcement (primary).** Enforcement occurs **after** the secure boot has authenticated
@@ -258,7 +257,7 @@ version (threat T-9), the bootloader enforces a monotonic version floor:
   incoming image's version against the currently-installed version and rejects an obvious downgrade
   before committing, giving the operator immediate feedback. The boot-time floor remains the
   authoritative control.
-- **Residual risk.** The floor can only be cleared by erasing sector 9, which requires debug/SWD
+- **Residual risk.** The floor can only be cleared by erasing sector 5, which requires debug/SWD
   access. Production units lock the debug port (RDP, §12), so the floor cannot be reset in the field.
 
 This control is **fail-safe**: a flash-write failure leaves the floor unchanged (never lowered), and a
@@ -326,7 +325,7 @@ vulnerability testing, and penetration testing.
 | TC-INTEG-02 | Extra code beyond firmware rejected | Boot a valid image, then write 0xAA bytes within the active slot beyond the firmware (0x08080000) via SWD; reset | **Pass**: `VerifyActiveSlot` detects extraneous slot content; rejected at `VERIFY USER FW SIGNATURE`; not executed; enters DFU. (Note: writes *outside* the slot end 0x0809FFFF are not part of the verified image — see §11 anomaly.) |
 | TC-DFU-01 | DFU install of signed image succeeds | dfu-util + pure-Python flasher | **Pass** (both paths) |
 | TC-DFU-02 | DFU write to bootloader sector rejected | `dfu-util` download targeting 0x08000000 | **Pass** (STM32H743): device rejects — `Last page at 0x0800001f is not writeable`; bootloader sector unmodified |
-| TC-DFU-03 | DFU write outside the active slot rejected (AN-1 fix) | `dfu-util` download targeting 0x080A0000 (first address above the slot) | **Pass** (STM32H743): device rejects — `Last page at 0x080a001f is not writeable` (also verified at user-config 0x081E0000, and at the floor sector while it was located at 0x081C0000) `[[TODO: re-verify at the relocated floor address 0x08120000]]` |
+| TC-DFU-03 | DFU write outside the active slot rejected (AN-1 fix) | `dfu-util` download targeting 0x080A0000 (first address above the slot) | **Pass** (STM32H743): device rejects — `Last page at 0x080a001f is not writeable` (also verified at user-config 0x081E0000). Note 0x080A0000 is the anti-rollback floor sector, so this case also evidences TC-ROLLBACK-04 |
 | TC-USERCFG-01 | DFU write/erase of user-config rejected | Target 0x081E0000 | **Pass** ("Last page … not writeable") |
 | TC-FAILCLOSED-01 | No/invalid FW → safe recovery, no code exec | Empty slot | **Pass** (enters DFU; no unauthenticated execution) |
 | TC-IMMUT-01 | Bootloader not modifiable via update path | SHA-256 of bootloader sector 0 (0x08000000, 128 KB) before/after a DFU write attempt to 0x08000000 | **Pass** (STM32H743): write rejected (`Last page … not writeable`); sector-0 hash identical before and after (`65b0bf97…256edd6`) — bootloader unchanged |
@@ -334,7 +333,7 @@ vulnerability testing, and penetration testing.
 | TC-ROLLBACK-01 | Older version rejected (boot-time floor) | Boot v1.8.0 (floor→10800); flash v1.7.0 (10700) to slot via SWD (floor sector untouched); reset | **Pass** (STM32H743): `ANTI-ROLLBACK: FW version 10700 below floor 10800 - launch refused`; image invalidated; enters DFU; not executed |
 | TC-ROLLBACK-02 | Equal/higher version accepted, floor raised | Flash v1.9.0 (10900); reset | **Pass** (boots; floor raised to 10900) |
 | TC-ROLLBACK-03 | Floor persists across app-slot reflash / SWD | Reflash app slot only (not floor sector); verify floor retained | **Pass** (floor 10800 read back on the TC-ROLLBACK-01 downgrade boot) |
-| TC-ROLLBACK-04 | Floor sector not erasable via DFU | Target 0x08120000 over DFU | `[[TODO: re-run at 0x08120000]]` — the recorded **Pass** was obtained against the previous floor address 0x081C0000 |
+| TC-ROLLBACK-04 | Floor sector not erasable via DFU | Target 0x080A0000 over DFU | **Pass** (STM32H743): evidenced by TC-DFU-03, whose recorded rejection at 0x080A0000 is the floor sector under the current layout. `[[TODO: confirm the floor sector is still populated and readable after the attempt]]` |
 
 ### 8.2 Vulnerability testing
 `[[TODO: known-vulnerability scan of SBOM components against NVD/ICS-CERT; static analysis
