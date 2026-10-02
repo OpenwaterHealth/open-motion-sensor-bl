@@ -61,7 +61,7 @@ jobs:
             echo "::error::SECOREBIN_AES_KEY secret is not set — cannot build SECoreBin." >&2
             exit 1
           fi
-          python3 -m pip install --quiet --disable-pip-version-check cryptography
+          python3 -m pip install --quiet --disable-pip-version-check cryptography==50.0.1
           # AES key (secret) -> raw 16 bytes
           printf '%s' "$SECOREBIN_AES_KEY" | base64 -d > "$RUNNER_TEMP/aes128.bin"
           if [ "$(wc -c < "$RUNNER_TEMP/aes128.bin")" -ne 16 ]; then
