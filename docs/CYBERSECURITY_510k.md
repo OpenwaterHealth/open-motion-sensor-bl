@@ -295,7 +295,7 @@ attach it; include exact versions, suppliers, licenses, and known-vulnerability 
 | STM32H7 HAL / CMSIS | STMicroelectronics | STM32CubeH7 V1.13.0 (CMSIS Core v5.x) | HAL/driver | BSD-3 / Apache-2.0 | Sourced from STM32CubeH7 firmware package V1.13.0 |
 | STM32 USB Device Library (DFU/CDC) | STMicroelectronics | STM32CubeH7 V1.13.0 | Middleware | ST SLA | Update + app comms; from STM32CubeH7 V1.13.0 |
 | arm-none-eabi-gcc | Arm | 13.3.1 | Toolchain | GPL (toolchain) | Build only |
-| Python `cryptography` | PyCA | ≥ 41.0 | Build/sign tool | Apache-2.0/BSD | Off-device signing |
+| Python `cryptography` | PyCA | 50.0.1 (pinned) | Build/sign tool | Apache-2.0/BSD | Off-device signing |
 | Python `pyusb` + libusb | PyUSB / libusb | 1.3.x / 1.0 | Build/host tool | BSD / LGPL-2.1 | Off-device flasher |
 
 > Off-device build/sign/flash tools are listed because they form part of the secure-update **supply
