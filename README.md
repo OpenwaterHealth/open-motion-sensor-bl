@@ -148,3 +148,7 @@ before field/production deployment.
 > **Caution:** enabling the DAP lock or RDP level 2 disconnects the debugger.
 > Apply that pass only after the SWD connection is solid and everything else has
 > been validated.
+
+## License
+
+Openwater-authored bootloader code in this repository is offered under Apache-2.0; see [LICENSE](LICENSE). The repository also contains STMicroelectronics and other third-party components that remain under their own terms. In particular, the SBSFU and Secure Engine code is identified under ST SLA0044/SLA0048 in [the SBOM](sbom.cdx.json); component license files are retained under their respective directories. The Apache license does not replace those third-party terms. Review the component licenses before redistributing a complete bootloader image.
