@@ -21,9 +21,11 @@ Application **runs from**: `0x08020400` (slot + `SFU_IMG_IMAGE_OFFSET`)
 | Ninja | any | |
 | arm-none-eabi-gcc | 13.3.1 | tested |
 | OpenOCD | any | flash bootloader via ST-Link |
-| dfu-util | ≥ 0.9 | install application via USB DFU (option A) |
-| Python | ≥ 3.9 | key generation, signing, pure-Python DFU flasher |
-| pyusb | ≥ 1.3 | only for the pure-Python flasher (`flash_firmware.py`) |
+| Python | ≥ 3.9 | key generation, signing, USB DFU flasher |
+| pyusb | ≥ 1.3 | USB backend for the flasher (`flash_firmware.py`) |
+
+> Application images are installed with the repo's own `flash_firmware.py`.
+> Neither `dfu-util` nor the STM32CubeProgrammer CLI is used or required.
 
 ---
 
@@ -99,7 +101,7 @@ bootloader boots, finds no valid firmware, and **enters USB DFU download mode**
 (LED blinks, `0483:df11` enumerates). Confirm:
 
 ```sh
-dfu-util -l        # or:  python py-tools/flash_firmware.py list
+python py-tools/flash_firmware.py list
 ```
 
 UART4 (PD1 TX / PD0 RX, 115200 8N1) shows:
@@ -269,18 +271,10 @@ python py-tools/verify_firmware.py your_app_signed.bin --min-version 1.8.1   # a
 
 It needs only the public key (`keys/ecdsa_public.pem` by default; pass
 `--public-key` for a bootloader built with local test keys) and checks the
-header signature, `FwTag`, size and trailing data. Option B below runs it
-automatically; with Option A (dfu-util) run it by hand first.
+header signature, `FwTag`, size and trailing data. `flash_firmware.py` runs
+it automatically before touching the device.
 
-### Option A — dfu-util
-
-```sh
-dfu-util -D your_app_signed.bin -a 0 -s 0x08020000:leave
-```
-*(The `Error during download get_status` after `:leave` is benign — the device
-detaches/resets immediately. `Invalid DFU suffix` is also expected.)*
-
-### Option B — pure-Python flasher (no dfu-util)
+### Install over USB DFU (`flash_firmware.py`)
 
 ```sh
 python py-tools/flash_firmware.py your_app_signed.bin
@@ -294,8 +288,7 @@ python py-tools/flash_firmware.py leave                # reset device into the a
 
 `flash_firmware.py` uses `stm32dfu.py` (pure-Python DfuSe over pyusb). It
 auto-detects the device's DFU transfer size, erases the affected slot sector(s),
-writes the image to `0x08020000`, and resets — the equivalent of the dfu-util
-command above.
+writes the image to `0x08020000`, and resets.
 
 Before erasing anything it verifies the image (see "Check the image first") and
 reads the installed version from the slot header, and stops if the image would
@@ -305,9 +298,15 @@ negative-path tests only; the bootloader's own verification is unaffected.
 > **Windows / pyusb driver:** the "STM32 BOOTLOADER" device must be bound to a
 > WinUSB/libusb driver (use [Zadig](https://zadig.akeo.ie/)), or `stm32dfu.py`
 > will fall back to the libusb-1.0.dll bundled with STM32CubeProgrammer (see
-> `_CUBEPROG_LIBUSB_PATHS` in `stm32dfu.py`).
+> `_CUBEPROG_LIBUSB_PATHS` in `stm32dfu.py`). Only the DLL is borrowed; the
+> CubeProgrammer CLI itself is not used.
 
-### Option C — direct ST-Link (no DFU)
+> The bootloader speaks standard DfuSe (AN3156), so generic tools such as
+> `dfu-util` can talk to it, but they are not part of this workflow: they skip
+> the host-side image check above, so a bad image erases the installed
+> firmware before it is refused at boot.
+
+### Alternative — direct ST-Link (no DFU)
 
 ```sh
 openocd -f interface/stlink.cfg -f target/stm32h7x.cfg \
@@ -412,5 +411,5 @@ openocd -f interface/stlink.cfg -f target/stm32h7x.cfg \
 # per application build
 #   (1) link app at 0x08020400 + VTOR 0x08020400, then build your_app.bin
 python py-tools/sign_firmware.py --firmware your_app.bin --version 1 --output your_app_signed.bin
-python py-tools/flash_firmware.py your_app_signed.bin        # or: dfu-util -D your_app_signed.bin -a 0 -s 0x08020000:leave
+python py-tools/flash_firmware.py your_app_signed.bin
 ```
