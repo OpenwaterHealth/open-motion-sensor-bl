@@ -23,6 +23,9 @@
 /* USER CODE BEGIN INCLUDE */
 #include "main.h"
 #include "version.h"   /* FW_VERSION (CMake-generated git describe) */
+#include "se_def_metadata.h"          /* SE_FwRawHeaderTypeDef, SE_FW_HEADER_TOT_LEN */
+#include "se_interface_bootloader.h"  /* SE_VerifyHeaderSignature */
+#include "sfu_fwimg_regions.h"        /* SFU_IMG_IMAGE_OFFSET */
 #include <string.h>
 /* USER CODE END INCLUDE */
 
@@ -47,6 +50,33 @@ static volatile uint8_t s_dfu_image_written = 0U;
  * keep the debug port locked (RDP). */
 static uint8_t  s_cur_ver_captured  = 0U;   /* 1 once s_current_fw_version is latched */
 static uint16_t s_current_fw_version = 0U;  /* installed FwVersion at DFU entry (the floor) */
+
+/* Set when the host writes to DFU_RESET_VIRT_ADDR (see MEM_If_Write_FS). The
+ * bootloader main loop polls DFU_ResetRequested() and performs the reset. */
+static volatile uint8_t s_dfu_reset_requested = 0U;
+
+/* Header check before the installed image is destroyed.
+ *
+ * There is one application slot, so a DFU download has to erase the installed
+ * image before the new one is complete, and SBSFU only verifies the new image at
+ * the next boot. Without a check here a corrupt, wrongly signed or downgraded
+ * file costs the device its working firmware before it is refused (observed on
+ * the bench, 2026-10-06). So erase requests are not executed when they arrive:
+ * they are recorded in s_pending_erase_mask, and the first block the host
+ * writes — which in the DfuSe sequence is the signed header at the slot start —
+ * is checked first (magic, ECDSA signature through the Secure Engine, FwVersion
+ * not below the installed one, FwSize fits the slot). Only then is the header
+ * sector erased and the block programmed; every other pending sector is erased
+ * when the first block for it arrives. A refused header fails the DNLOAD, and
+ * the installed image is still intact.
+ *
+ * Each DNLOAD therefore carries at most one sector erase, exactly as before, so
+ * the host-side timing (dfu-util, STM32CubeProgrammer, stm32dfu.py) is
+ * unchanged and no host protocol change is needed. */
+static uint8_t  s_header_accepted    = 0U;   /* 1 once this download's header passed the check */
+static uint32_t s_pending_erase_mask = 0U;   /* bit n: erase of sector n requested, not yet done */
+static SE_FwRawHeaderTypeDef s_dfu_header;   /* copy of the received header (must be in SBSFU RAM for the SE) */
+static uint32_t s_next_write_addr    = 0U;   /* where the next data block will land (0 = none written yet) */
 
 /* USER CODE END PV */
 
@@ -112,6 +142,16 @@ static uint16_t s_current_fw_version = 0U;  /* installed FwVersion at DFU entry 
 #define DFU_VERSION_VIRT_ADDR   0xFFFFFF00U
 #define DFU_VERSION_READ_LEN    64U
 
+/* Virtual DFU DNLOAD address (outside flash). A host that points the DfuSe
+ * address pointer here and downloads any payload requests a device reset —
+ * the clean way to leave DFU mode without flashing (e.g. the SDK aborting an
+ * update after its pre-flight downgrade check). No flash is touched: the
+ * request is only latched here and the bootloader main loop performs the
+ * reset after the host's final GETSTATUS handshake completes. SBSFU fully
+ * re-verifies the slot on the way back up, so this can never launch an
+ * unverified image. */
+#define DFU_RESET_VIRT_ADDR     0xFFFFFF08U
+
 /* USER CODE END PRIVATE_DEFINES */
 
 /**
@@ -173,7 +213,10 @@ static uint16_t MEM_If_GetStatus_FS(uint32_t Add, uint8_t Cmd, uint8_t *buffer);
 static uint16_t dfu_read_slot_version(void);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
-
+static uint32_t dfu_sector_index(uint32_t Add);
+static uint16_t dfu_erase_sector(uint32_t Add);
+static uint8_t  dfu_check_header(const SE_FwRawHeaderTypeDef *p_hdr);
+static void     dfu_latch_installed_version(void);
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
@@ -202,6 +245,10 @@ __ALIGN_BEGIN USBD_DFU_MediaTypeDef USBD_DFU_fops_FS __ALIGN_END =
 uint16_t MEM_If_Init_FS(void)
 {
   /* USER CODE BEGIN 0 */
+  /* New session: every download starts with an unchecked header. */
+  s_header_accepted    = 0U;
+  s_pending_erase_mask = 0U;
+  s_next_write_addr    = 0U;
   return (USBD_OK);
   /* USER CODE END 0 */
 }
@@ -235,50 +282,25 @@ uint16_t MEM_If_Erase_FS(uint32_t Add)
   /* Anti-rollback: latch the currently-installed version BEFORE any erase wipes
    * the active-slot header. Done once per DFU session, on the first erase (the
    * slot is still intact at this point regardless of which sector erases first). */
-  if (s_cur_ver_captured == 0U)
+  dfu_latch_installed_version();
+
+  /* A new erase of the header sector starts a new download: its header has to
+   * pass the check again before anything is erased. */
+  if (dfu_sector_index(Add) == dfu_sector_index(APP_FLASH_BASE))
   {
-    s_cur_ver_captured   = 1U;
-    s_current_fw_version = dfu_read_slot_version();
+    s_header_accepted = 0U;
+  }
+  s_next_write_addr = 0U;                    /* a download starts with erase requests */
+
+  /* Deferred until the header has been checked (see s_header_accepted); the
+   * sector is erased when its first block is written. */
+  if (s_header_accepted == 0U)
+  {
+    s_pending_erase_mask |= (1UL << dfu_sector_index(Add));
+    return (USBD_OK);
   }
 
-  FLASH_EraseInitTypeDef eraseInit = {0};
-  uint32_t sectorError = 0;
-
-  eraseInit.TypeErase    = FLASH_TYPEERASE_SECTORS;
-  eraseInit.NbSectors    = 1;
-  eraseInit.VoltageRange = FLASH_VOLTAGE_RANGE_3;
-
-  if (Add < FLASH_BANK2_BASE)
-  {
-    eraseInit.Banks  = FLASH_BANK_1;
-    eraseInit.Sector = (uint32_t)((Add - FLASH_BASE) / DFU_SECTOR_SIZE);
-  }
-  else
-  {
-    eraseInit.Banks  = FLASH_BANK_2;
-    eraseInit.Sector = (uint32_t)((Add - FLASH_BANK2_BASE) / DFU_SECTOR_SIZE);
-  }
-
-  HAL_FLASH_Unlock();
-  HAL_StatusTypeDef status = HAL_FLASHEx_Erase(&eraseInit, &sectorError);
-  HAL_FLASH_Lock();
-
-  if (status == HAL_OK)
-  {
-    /* A new application image is being installed: clear the failsafe boot
-     * counter (RTC->BKP6R) so the freshly flashed firmware gets a clean set of
-     * boot attempts. Without this, if we entered DFU because the counter hit
-     * BL_BOOT_FAIL_MAX, it would still be at the limit after the download and
-     * the bootloader would refuse to launch the new image (re-entering DFU and
-     * causing the host's manifest get_status to fail) until a power cycle.
-     * Backup-domain write access was already enabled in main(); re-assert DBP
-     * defensively as this is a one-shot, low-cost operation. */
-    HAL_PWR_EnableBkUpAccess();
-    RTC->BKP6R = 0U;
-    __DSB();
-  }
-
-  return (status == HAL_OK) ? USBD_OK : USBD_FAIL;
+  return dfu_erase_sector(Add);
 
   /* USER CODE END 2 */
 }
@@ -298,10 +320,45 @@ uint16_t MEM_If_Write_FS(uint8_t *src, uint8_t *dest, uint32_t Len)
 
   uint32_t addr = (uint32_t)dest;
 
+  /* Virtual reset request: latch and ACK without touching flash. The main
+   * loop resets after the host's status handshake completes. Deliberately
+   * does NOT set s_dfu_image_written — no image state changes here. */
+  if (addr == DFU_RESET_VIRT_ADDR)
+  {
+    s_dfu_reset_requested = 1U;
+    return (USBD_OK);
+  }
+
   /* Protect bootloader */
   if (addr < APP_FLASH_BASE || (addr + Len) > FLASH_END_ADDR)
   {
     return (USBD_FAIL);
+  }
+
+  /* First block of a download: it must be the signed header at the slot start,
+   * and it must pass the check before any sector is erased. */
+  if (s_header_accepted == 0U)
+  {
+    if ((addr != APP_FLASH_BASE) || (Len < SE_FW_HEADER_TOT_LEN))
+    {
+      return (USBD_FAIL);
+    }
+    dfu_latch_installed_version();            /* in case the host wrote without erasing */
+    memcpy(&s_dfu_header, src, sizeof(s_dfu_header));
+    if (dfu_check_header(&s_dfu_header) != 0U)
+    {
+      return (USBD_FAIL);                     /* refused: the installed image is untouched */
+    }
+    s_header_accepted = 1U;
+  }
+
+  /* Erase deferred for this sector? Do it now, before the first block lands. */
+  if ((s_pending_erase_mask & (1UL << dfu_sector_index(addr))) != 0U)
+  {
+    if (dfu_erase_sector(addr & ~(DFU_SECTOR_SIZE - 1UL)) != USBD_OK)
+    {
+      return (USBD_FAIL);
+    }
   }
 
   /* STM32H7 flash word = 256 bits = 32 bytes; data buffer must be 4-byte aligned */
@@ -333,6 +390,7 @@ uint16_t MEM_If_Write_FS(uint8_t *src, uint8_t *dest, uint32_t Len)
 
   HAL_FLASH_Lock();
 
+  s_next_write_addr   = addr;  /* already advanced past this block */
   s_dfu_image_written = 1U;   /* a new image was programmed: arm post-manifest reboot */
 
   return (USBD_OK);
@@ -373,8 +431,14 @@ uint8_t *MEM_If_Read_FS(uint8_t *src, uint8_t *dest, uint32_t Len)
    * floor, the user-config sector, or RAM. Reject anything outside
    * [APP_FLASH_BASE, FLASH_END_ADDR); the read range must also fit entirely
    * inside the window. The comparison against (FLASH_END_ADDR - addr) is written
-   * to avoid the unsigned overflow that (addr + Len) would risk. Returning NULL
-   * makes the DFU class STALL the packet and NAK the command (usbd_dfu.c). */
+   * to avoid the unsigned overflow that (addr + Len) would risk.
+   *
+   * A refused read answers with zeros rather than NULL: on a NULL return the
+   * DFU class (usbd_dfu.c, DFU_Upload) writes the DFU_ERROR_STALLEDPKT status
+   * code into dev_state, a value that is not a DFU state, and the device then
+   * answers every further request with a STALL until it is power-cycled
+   * (observed on the bench, 2026-10-06). Zeros leak nothing and keep the
+   * state machine sane. */
   {
     uint32_t addr = (uint32_t)src;
 
@@ -382,7 +446,8 @@ uint8_t *MEM_If_Read_FS(uint8_t *src, uint8_t *dest, uint32_t Len)
         (addr >= FLASH_END_ADDR) ||
         (Len  > (FLASH_END_ADDR - addr)))
     {
-      return (NULL);
+      memset(dest, 0, Len);
+      return dest;
     }
   }
 
@@ -406,12 +471,38 @@ uint16_t MEM_If_GetStatus_FS(uint32_t Add, uint8_t Cmd, uint8_t *buffer)
   uint32_t timeout_ms;
   switch (Cmd)
   {
+    /* The DFU class asks for the poll interval first and performs the Erase()/
+     * Write() afterwards, inside the GETSTATUS reply (EP0_TxReady). The interval
+     * must therefore cover the work the next callback will do, or the host polls
+     * while the sector erase is still running and the transfer fails. */
     case DFU_MEDIA_PROGRAM:
-      timeout_ms = 10U;    /* 10 ms per write block */
+    {
+      /* Add is the DfuSe address pointer, not the block address: the next
+       * block lands where the previous write stopped. */
+      uint32_t next = (s_next_write_addr != 0U) ? s_next_write_addr : Add;
+      if ((next >= APP_FLASH_BASE) && (next < FLASH_END_ADDR) &&
+          ((s_pending_erase_mask & (1UL << dfu_sector_index(next))) != 0U))
+      {
+        timeout_ms = 4010U;  /* this block carries a deferred sector erase */
+      }
+      else
+      {
+        timeout_ms = 10U;    /* 10 ms per write block */
+      }
       break;
+    }
 
     case DFU_MEDIA_ERASE:
-      timeout_ms = 4000U;  /* 4 s per 128 KB sector on STM32H743 */
+      /* Add is the address pointer here too, not the sector being erased, so
+       * only the session state can tell whether the erase will be deferred. */
+      if (s_header_accepted == 0U)
+      {
+        timeout_ms = 10U;    /* will be deferred: nothing is erased yet (see MEM_If_Erase_FS) */
+      }
+      else
+      {
+        timeout_ms = 4000U;  /* 4 s per 128 KB sector on STM32H743 */
+      }
       break;
 
     default:
@@ -429,6 +520,112 @@ uint16_t MEM_If_GetStatus_FS(uint32_t Add, uint8_t Cmd, uint8_t *buffer)
 }
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
+
+/**
+  * @brief  Flat sector index (0..15) of a flash address, across both banks.
+  */
+static uint32_t dfu_sector_index(uint32_t Add)
+{
+  return (Add - FLASH_BASE) / DFU_SECTOR_SIZE;
+}
+
+/**
+  * @brief  Latch the installed FwVersion once per DFU session, while the slot
+  *         header is still intact. Harmless if the slot is already empty.
+  */
+static void dfu_latch_installed_version(void)
+{
+  if (s_cur_ver_captured == 0U)
+  {
+    s_cur_ver_captured   = 1U;
+    s_current_fw_version = dfu_read_slot_version();
+  }
+}
+
+/**
+  * @brief  Check a received signed header before the installed image is erased.
+  * @note   The signature check runs in the Secure Engine, which holds the ECDSA
+  *         public key; the header copy must live in SBSFU RAM for the SE to
+  *         accept it. FwVersion is only compared once the signature is good.
+  * @retval 0 if the header is acceptable, 1 if the download must be refused.
+  */
+static uint8_t dfu_check_header(const SE_FwRawHeaderTypeDef *p_hdr)
+{
+  SE_StatusTypeDef se_status = SE_KO;
+  const uint8_t   *magic     = (const uint8_t *)p_hdr->SFUMagic;
+
+  if ((magic[0] != 'S') || (magic[1] != 'F') || (magic[2] != 'U') || (magic[3] != '1'))
+  {
+    return 1U;
+  }
+
+  if (SE_VerifyHeaderSignature(&se_status, (SE_FwRawHeaderTypeDef *)p_hdr) != SE_SUCCESS)
+  {
+    return 1U;
+  }
+
+  /* Fields below are now authenticated. */
+  if ((p_hdr->FwVersion == 0U) || (p_hdr->FwVersion < s_current_fw_version))
+  {
+    return 1U;    /* downgrade (same rule as DFU_IsRollback, applied before the erase) */
+  }
+
+  if ((p_hdr->FwSize == 0U) ||
+      (p_hdr->FwSize > (FLASH_END_ADDR - APP_FLASH_BASE - SFU_IMG_IMAGE_OFFSET)))
+  {
+    return 1U;    /* does not fit the slot */
+  }
+
+  return 0U;
+}
+
+/**
+  * @brief  Erase one application-slot sector now.
+  */
+static uint16_t dfu_erase_sector(uint32_t Add)
+{
+  FLASH_EraseInitTypeDef eraseInit = {0};
+  uint32_t sectorError = 0;
+
+  eraseInit.TypeErase    = FLASH_TYPEERASE_SECTORS;
+  eraseInit.NbSectors    = 1;
+  eraseInit.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+
+  if (Add < FLASH_BANK2_BASE)
+  {
+    eraseInit.Banks  = FLASH_BANK_1;
+    eraseInit.Sector = (uint32_t)((Add - FLASH_BASE) / DFU_SECTOR_SIZE);
+  }
+  else
+  {
+    eraseInit.Banks  = FLASH_BANK_2;
+    eraseInit.Sector = (uint32_t)((Add - FLASH_BANK2_BASE) / DFU_SECTOR_SIZE);
+  }
+
+  HAL_FLASH_Unlock();
+  HAL_StatusTypeDef status = HAL_FLASHEx_Erase(&eraseInit, &sectorError);
+  HAL_FLASH_Lock();
+
+  if (status == HAL_OK)
+  {
+    /* A new application image is being installed: clear the failsafe boot
+     * counter (RTC->BKP6R) so the freshly flashed firmware gets a clean set of
+     * boot attempts. Without this, if we entered DFU because the counter hit
+     * BL_BOOT_FAIL_MAX, it would still be at the limit after the download and
+     * the bootloader would refuse to launch the new image (re-entering DFU and
+     * causing the host's manifest get_status to fail) until a power cycle.
+     * Backup-domain write access was already enabled in main(); re-assert DBP
+     * defensively as this is a one-shot, low-cost operation. */
+    HAL_PWR_EnableBkUpAccess();
+    RTC->BKP6R = 0U;
+    __DSB();
+
+    s_pending_erase_mask &= ~(1UL << dfu_sector_index(Add));
+  }
+
+  return (status == HAL_OK) ? USBD_OK : USBD_FAIL;
+}
+
 
 /**
   * @brief  Reports whether a DFU download has completed and the host has
@@ -518,7 +715,7 @@ uint8_t DFU_IsRollback(void)
   */
 void DFU_InvalidateImage(void)
 {
-  (void)MEM_If_Erase_FS(APP_FLASH_BASE);
+  (void)dfu_erase_sector(APP_FLASH_BASE);
 }
 
 /**
@@ -528,6 +725,69 @@ void DFU_InvalidateImage(void)
 void DFU_ClearDownloadState(void)
 {
   s_dfu_image_written = 0U;
+}
+
+/**
+  * @brief  Reports whether the host requested a device reset via a DNLOAD to
+  *         DFU_RESET_VIRT_ADDR. Polled by the bootloader main loop, which
+  *         performs the actual NVIC_SystemReset (after a short delay so the
+  *         host's final USB status transaction completes).
+  * @retval 1 if a reset was requested, else 0.
+  */
+uint8_t DFU_ResetRequested(void)
+{
+  return s_dfu_reset_requested;
+}
+
+/**
+  * @brief  Erase slot sectors beyond the just-downloaded image that are not clean.
+  * @note   A host only erases the sectors its file covers. If the previous image
+  *         was larger, its tail survives in the sectors above the new image and
+  *         SBSFU's VerifySlot (which accepts only 0x00/0xFF beyond the image)
+  *         would refuse the new image at boot. Runs from the main loop, after
+  *         manifestation, so the per-sector erase time does not sit inside a
+  *         USB control transfer. The sector containing the image end was erased
+  *         by the download itself and is left alone.
+  */
+void DFU_CleanSlotTail(void)
+{
+  const uint8_t *hdr = (const uint8_t *)APP_FLASH_BASE;
+  uint32_t fw_size;
+  uint32_t image_end;
+  uint32_t sector;
+
+  if ((hdr[0] != 'S') || (hdr[1] != 'F') || (hdr[2] != 'U') || (hdr[3] != '1'))
+  {
+    return;                                   /* no image: nothing to protect */
+  }
+  fw_size   = *(const uint32_t *)(APP_FLASH_BASE + 8U);     /* FwSize at 0x008 */
+  image_end = APP_FLASH_BASE + SFU_IMG_IMAGE_OFFSET + fw_size;
+  if ((fw_size == 0U) || (image_end > FLASH_END_ADDR))
+  {
+    return;                                   /* SBSFU will reject it anyway */
+  }
+
+  for (sector = dfu_sector_index(image_end - 1U) + 1U;
+       sector < dfu_sector_index(FLASH_END_ADDR);
+       sector++)
+  {
+    const uint32_t *p   = (const uint32_t *)(FLASH_BASE + (sector * DFU_SECTOR_SIZE));
+    const uint32_t *end = p + (DFU_SECTOR_SIZE / 4U);
+    uint8_t dirty = 0U;
+
+    for (; p < end; p++)
+    {
+      if ((*p != 0x00000000U) && (*p != 0xFFFFFFFFU))
+      {
+        dirty = 1U;
+        break;
+      }
+    }
+    if (dirty != 0U)
+    {
+      (void)dfu_erase_sector(FLASH_BASE + (sector * DFU_SECTOR_SIZE));
+    }
+  }
 }
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */

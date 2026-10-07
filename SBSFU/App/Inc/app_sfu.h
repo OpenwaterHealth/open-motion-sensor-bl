@@ -138,11 +138,23 @@ extern "C" {
  * Enabled: all security IPs (WRP, watchdog...) are disabled.
  * Disabled: the security IPs can be used (if their specific compiler switches are enabled too).
  *
+ * It is selected by the build, not here: the CMake option SBSFU_ENABLE_PROTECTIONS
+ * (OFF in the Debug preset, ON in the Release preset — see CMakePresets.json)
+ * defines exactly one of SECBOOT_DISABLE_SECURITY_IPS / SECBOOT_ENABLE_SECURITY_IPS.
+ * A build that defines neither or both is refused so the choice is always explicit.
+ *
+ *   SECBOOT_DISABLE_SECURITY_IPS : development mode. No option bytes are touched;
+ *                                  a debug probe can be attached (the state the
+ *                                  CVA and PTR-2026-1-5 found on fielded units).
+ *   SECBOOT_ENABLE_SECURITY_IPS  : the protections in the block below are applied
+ *                                  by the bootloader at first boot (SECBOOT_OB_DEV_MODE).
  */
-
-#define SECBOOT_DISABLE_SECURITY_IPS  /*!< DEVELOPMENT MODE: All flash/OB security features disabled.
-                                         Re-enable individual protections (WRP, RDP, PCROP, DAP) when
-                                         moving to production. See app_sfu.h security block below. */
+#if defined(SECBOOT_DISABLE_SECURITY_IPS) && defined(SECBOOT_ENABLE_SECURITY_IPS)
+#error "SECBOOT_DISABLE_SECURITY_IPS and SECBOOT_ENABLE_SECURITY_IPS are both defined; check SBSFU_ENABLE_PROTECTIONS."
+#endif
+#if !defined(SECBOOT_DISABLE_SECURITY_IPS) && !defined(SECBOOT_ENABLE_SECURITY_IPS)
+#error "Neither SECBOOT_DISABLE_SECURITY_IPS nor SECBOOT_ENABLE_SECURITY_IPS is defined; build through CMake (SBSFU_ENABLE_PROTECTIONS)."
+#endif
 
 #if !defined(SECBOOT_DISABLE_SECURITY_IPS)
 
@@ -159,11 +171,15 @@ extern "C" {
 #define SFU_DMA_PROTECT_ENABLE
 /*#define SFU_IWDG_PROTECT_ENABLE*/  /*!< Disabled: IWDG HAL driver not included in this project build.
                                         Enable when stm32h7xx_hal_iwdg.h/c are added to Drivers/. */
-#define SFU_MPU_PROTECT_ENABLE     /*!< MPU protection:
+/*#define SFU_MPU_PROTECT_ENABLE*/ /*!< MPU protection:
                                         Enables/Disables the MPU protection.
                                         If Secure Engine isolation is ensured by MPU (see SFU_ISOLATE_SE_WITH_MPU in
                                         SE_CoreBin\Inc\se_low_level.h), then this switch also enables/disables it, in
-                                        addition to the overall MPU protection. */
+                                        addition to the overall MPU protection.
+                                        Disabled on this port in the protected build too: the application runs
+                                        privileged, so MPU isolation buys no confidentiality and the launch path
+                                        it needs has not been validated on this board. See the key-RAM wipe
+                                        note below; PCROP (above) is what hides the flash key. */
 
 
 /*#define SFU_FINAL_SECURE_LOCK_ENABLE */   /*!< WARNING: Should be enabled at the end of product development and test
@@ -214,12 +230,12 @@ extern "C" {
  *     SFU_MPU_UNPRIV_BOOT AND an unprivileged-safe application (a stock CubeMX
  *     app HardFaults unprivileged). The plumbing for that path is left in place
  *     but gated off.
+ *
+ * The wipe applies in both the development and the protected build: PCROP hides
+ * the flash copy of the key, this hides the RAM copy.
  */
-#if defined(SECBOOT_DISABLE_SECURITY_IPS)
 #define SFU_WIPE_SE_RAM_ON_EXIT              /*!< zeroize SE key RAM before exit */
-/* #define SFU_MPU_PROTECT_ENABLE */         /*!< OFF: no benefit for a privileged app; see above */
 /* #define SFU_MPU_UNPRIV_BOOT */            /*!< OFF: needs an unprivileged-safe app */
-#endif /* SECBOOT_DISABLE_SECURITY_IPS */
 
 /**
   * The define below (SECBOOT_OB_DEV_MODE) determines if the OPTION BYTES should be handled in Development mode or not.

@@ -12,7 +12,7 @@ Output image layout (written to SLOT_ACTIVE_1 starting at 0x08020000 via DFU):
 
     Offset 0x000  [  4 B]  SFUMagic      "SFU1"
     Offset 0x004  [  2 B]  ProtocolVersion  0x0001
-    Offset 0x006  [  2 B]  FwVersion     user-specified
+    Offset 0x006  [  2 B]  FwVersion     major*10000 + minor*100 + patch, see pack_semver()
     Offset 0x008  [  4 B]  FwSize        size of encrypted firmware (bytes)
     Offset 0x00C  [  4 B]  PartialFwOffset  0
     Offset 0x010  [  4 B]  PartialFwSize    0
@@ -37,7 +37,7 @@ Usage
         --firmware   path/to/app.bin          \\
         --private-key  py-tools/keys/ecdsa_private.pem \\
         --aes-key      py-tools/keys/aes128.bin        \\
-        --version      1                               \\
+        --version      1.0.0                           \\
         --output       signed_app.bin
 """
 
@@ -85,6 +85,88 @@ IMAGE_OFFSET      = 0x400   # = SFU_IMG_IMAGE_OFFSET (1024 bytes)
 
 AES_BLOCK         = 16     # AES block size in bytes
 FLASH_WORD        = 32     # STM32H7 flash word (min programmable unit)
+
+# ---------------------------------------------------------------------------
+# FwVersion (anti-rollback) semver <-> uint16 encoding
+# ---------------------------------------------------------------------------
+# The signed header's 16-bit FwVersion is the decimal encoding
+#
+#   FwVersion = major * 10000 + minor * 100 + patch
+#
+# which is what the firmware release workflows have signed every released image
+# with (1.8.1 -> 10801). It must never change: fielded units carry a monotonic
+# anti-rollback floor in this encoding, and an image signed under a different
+# scheme would compare below the floor and be refused as a downgrade.
+#
+# minor and patch are limited to 0..99 so the integer orders exactly like
+# (major, minor, patch); the 16-bit field then caps the range at 6.55.35.
+# 0.0.0 encodes to 0, which SBSFU reserves for "no firmware", so the minimum
+# valid release is 0.0.1. The bootloader compares the raw integer with a plain
+# unsigned `<` and needs no knowledge of this scheme.
+FWVER_MAJOR_MULT  = 10000
+FWVER_MINOR_MULT  = 100
+FWVER_MINOR_MAX   = 99
+FWVER_PATCH_MAX   = 99
+FWVER_MAX         = 0xFFFF   # 6.55.35
+
+
+def pack_semver(major: int, minor: int, patch: int) -> int:
+    """Encode semver (major, minor, patch) as the 16-bit FwVersion field.
+
+    Ranges: minor 0-99, patch 0-99, and the result must fit 16 bits (max
+    6.55.35). 0.0.0 is invalid. The result orders exactly like the tuple.
+    """
+    if major < 0:
+        raise ValueError(f"major must be >= 0, got {major}")
+    if not (0 <= minor <= FWVER_MINOR_MAX):
+        raise ValueError(f"minor must be 0..{FWVER_MINOR_MAX}, got {minor}")
+    if not (0 <= patch <= FWVER_PATCH_MAX):
+        raise ValueError(f"patch must be 0..{FWVER_PATCH_MAX}, got {patch}")
+    packed = major * FWVER_MAJOR_MULT + minor * FWVER_MINOR_MULT + patch
+    if packed == 0:
+        raise ValueError("0.0.0 is not a valid FwVersion (minimum is 0.0.1)")
+    if packed > FWVER_MAX:
+        raise ValueError(
+            f"{major}.{minor}.{patch} does not fit the 16-bit FwVersion (max 6.55.35)"
+        )
+    return packed
+
+
+def unpack_semver(fw_version: int) -> tuple[int, int, int]:
+    """Inverse of pack_semver — return (major, minor, patch)."""
+    if not (0 <= fw_version <= FWVER_MAX):
+        raise ValueError(f"FwVersion must fit in 16 bits, got {fw_version}")
+    major = fw_version // FWVER_MAJOR_MULT
+    minor = (fw_version // FWVER_MINOR_MULT) % 100
+    patch = fw_version % 100
+    return major, minor, patch
+
+def parse_version_arg(value: str) -> int:
+    """Parse the --version CLI argument.
+
+    Accepts either a dotted semver 'MAJOR.MINOR.PATCH' (preferred) or a raw
+    decimal/hex integer that is already packed. Returns the packed uint16.
+    """
+    s = value.strip()
+    if "." in s:
+        parts = s.split(".")
+        if len(parts) != 3:
+            raise ValueError(
+                f"semver must be MAJOR.MINOR.PATCH (got '{value}')"
+            )
+        try:
+            major, minor, patch = (int(p) for p in parts)
+        except ValueError as exc:
+            raise ValueError(f"semver components must be integers: '{value}'") from exc
+        return pack_semver(major, minor, patch)
+    # Raw integer (decimal or 0x-prefixed hex)
+    try:
+        packed = int(s, 0)
+    except ValueError as exc:
+        raise ValueError(f"--version must be 'MAJOR.MINOR.PATCH' or an integer, got '{value}'") from exc
+    if not (1 <= packed <= 0xFFFF):
+        raise ValueError(f"raw FwVersion must be in 1..65535, got {packed}")
+    return packed
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +219,8 @@ def sign_firmware(
     firmware_bin    : raw application .bin (starts at application load address)
     private_key_pem : PEM-encoded ECDSA P-256 private key
     aes_key         : 16-byte AES-128 key
-    fw_version      : 16-bit firmware version number (≥ 1)
+    fw_version      : 16-bit packed FwVersion (see pack_semver);
+                      must be in [1, 0xFFFF] — 0 (0.0.0) is invalid.
 
     Returns
     -------
@@ -146,6 +229,10 @@ def sign_firmware(
 
     if len(aes_key) != 16:
         raise ValueError(f"AES key must be 16 bytes, got {len(aes_key)}")
+    if not (1 <= fw_version <= 0xFFFF):
+        raise ValueError(
+            f"fw_version must be in 1..65535 (0 is invalid); got {fw_version}"
+        )
 
     # Load private key
     priv = serialization.load_pem_private_key(private_key_pem, password=None)
@@ -258,8 +345,10 @@ def main() -> None:
         help="Raw 16-byte AES-128 key binary (default: py-tools/keys/aes128.bin).",
     )
     parser.add_argument(
-        "--version", type=int, default=1,
-        help="Firmware version number (1–65535, default: 1).",
+        "--version", type=str, default="0.0.1",
+        help="Firmware version, dotted semver 'MAJOR.MINOR.PATCH' "
+             "(encoded as major*10000 + minor*100 + patch; max 6.55.35; 0.0.0 invalid). "
+             "A raw integer (1..65535) is also accepted. Default: 0.0.1.",
     )
     parser.add_argument(
         "--output",
@@ -274,14 +363,21 @@ def main() -> None:
     private_key_pem = Path(args.private_key).read_bytes()
     aes_key         = Path(args.aes_key).read_bytes()
 
+    try:
+        fw_version = parse_version_arg(args.version)
+    except ValueError as exc:
+        parser.error(str(exc))
+    major, minor, patch = unpack_semver(fw_version)
+
     print(f"[sign_firmware] Input        : {fw_path}  ({len(firmware_bin):,} bytes)")
-    print(f"[sign_firmware] FW version   : {args.version}")
+    print(f"[sign_firmware] FW version   : {major}.{minor}.{patch}  "
+          f"(FwVersion = {fw_version} / 0x{fw_version:04X})")
 
     signed = sign_firmware(
         firmware_bin    = firmware_bin,
         private_key_pem = private_key_pem,
         aes_key         = aes_key,
-        fw_version      = args.version,
+        fw_version      = fw_version,
     )
 
     out_path.write_bytes(signed)

@@ -24,6 +24,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "sfu_boot.h"   /* SBSFU secure boot service */
+#include "se_interface_bootloader.h" /* SE_Startup / SE_Init for the DFU header check */
 #include "usbd_dfu_if.h" /* DFU_ImageDownloadComplete() */
 #include "util.h"
 #include <stdio.h>
@@ -256,9 +257,12 @@ int main(void)
   MX_I2C1_Init();
   
   /* USER CODE BEGIN 2 */
+#if defined(DEBUG_ENABLED)
+  /* UART4 status output exists in Debug builds only (see DEBUG_ENABLED in
+   * CMakeLists.txt): a Release image carries neither the traces nor the strings. */
   if(force_dfu != 0U){
     PrintBootBanner(&huart4, FW_VERSION);
-    
+
     if (boot_fail != 0U)
     {
       const char fail_note[] =
@@ -267,11 +271,29 @@ int main(void)
       HAL_UART_Transmit(&huart4, (uint8_t *)fail_note, sizeof(fail_note) - 1, 250);
     }
   }
+#else
+  (void)boot_fail;
+#endif /* DEBUG_ENABLED */
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+
+  /* The DFU path checks each download's signed header through the Secure
+   * Engine before it erases the installed image (usbd_dfu_if.c). Bring the SE
+   * up for that here: on the request/boot-counter path SBSFU never ran, and on
+   * the no-valid-firmware path SBSFU wiped the SE RAM on its way out. Failure is
+   * not fatal — the check then refuses every header and the device stays in DFU
+   * with the installed image intact, which is the safe outcome. */
+  {
+    SE_StatusTypeDef se_status = SE_KO;
+    if (SE_Startup() == SE_SUCCESS)
+    {
+      (void)SE_Init(&se_status, SystemCoreClock);
+    }
+  }
+
   // Init USB
   BSP_Set_IO_Expander_Enable();
   BSP_USB_Hub_Enable();
@@ -300,19 +322,36 @@ int main(void)
         DFU_InvalidateImage();
         DFU_ClearDownloadState();
 
+#if defined(DEBUG_ENABLED)
         const char rb[] =
           "\r\n= [SBOOT] Anti-rollback: rejected older firmware version. "
           "Image erased — flash a build with an equal or higher version.\r\n\r\n";
         HAL_UART_Transmit(&huart4, (uint8_t *)rb, sizeof(rb) - 1, 250);
+#endif /* DEBUG_ENABLED */
       }
       else
       {
+        /* Erase whatever a larger previous image left above the new one, or
+         * SBSFU refuses the new image at boot (VerifySlot). */
+        DFU_CleanSlotTail();
+
         /* Reboot so SBSFU verifies and launches the freshly flashed firmware.
          * The brief delay lets the final USB control transfer settle and the
          * host tool exit cleanly before the bus drops. */
         HAL_Delay(50);
         NVIC_SystemReset();
       }
+    }
+
+    /* Host-requested reset (DNLOAD to the virtual reset address): the clean
+     * way for a host tool to leave DFU without flashing — e.g. the SDK
+     * aborting an update after its pre-flight downgrade check. SBSFU fully
+     * re-verifies the slot on the way back up, so if the slot is intact the
+     * application boots; if not, we simply return to DFU. */
+    if (DFU_ResetRequested() != 0U)
+    {
+      HAL_Delay(50);
+      NVIC_SystemReset();
     }
 
     HAL_GPIO_TogglePin(IND1_GPIO_Port, IND1_Pin);
