@@ -165,6 +165,12 @@ class STM32DFU:
     DFU_VERSION_ADDR = 0xFFFFFF00
     DFU_VERSION_LEN  = 64
 
+    # Virtual DNLOAD address that asks the bootloader to reset without flashing
+    # (usbd_dfu_if.c DFU_RESET_VIRT_ADDR). The DFU class is manifestation-
+    # tolerant, so a plain DfuSe "leave" (zero-length DNLOAD) no longer resets
+    # the device by itself; the bootloader main loop resets on this request.
+    DFU_RESET_ADDR   = 0xFFFFFF08
+
     def __init__(self, vid=None, pid=None, xfer_size=1024):
         """
         Args:
@@ -275,6 +281,50 @@ class STM32DFU:
 
         # Recover from any leftover error state
         self._ensure_idle()
+
+        # A refused out-of-window UPLOAD can leave the device's DFU state
+        # machine in a state that neither CLRSTATUS nor ABORT clears. A USB bus
+        # reset re-initialises the DFU class (no device reset, nothing flashed),
+        # so do that once and reopen the device.
+        try:
+            _, _, state, _ = self.get_status()
+        except Exception:
+            state = None
+        for attempt in range(2):
+            if state in (DFUState.DFU_IDLE, DFUState.DFU_DNLOAD_IDLE,
+                         DFUState.DFU_UPLOAD_IDLE):
+                return
+            try:
+                self._dev.reset()
+            except Exception:
+                pass
+            self.disconnect()
+            time.sleep(2.5)
+            state = self._reopen_after_reset()
+        if state not in (DFUState.DFU_IDLE, DFUState.DFU_DNLOAD_IDLE,
+                         DFUState.DFU_UPLOAD_IDLE):
+            raise DFUError(f"DFU device stuck in state {DFUState.name(state)} after a USB reset")
+
+    def _reopen_after_reset(self):
+        """Reopen the device after a bus reset; returns the DFU state seen."""
+        backend = _find_libusb()
+        dev = None
+        for _ in range(10):
+            dev = usb.core.find(idVendor=self.vid, idProduct=self.pid, backend=backend)
+            if dev is not None:
+                break
+            time.sleep(0.5)
+        if dev is None:
+            raise DFUError("DFU device did not come back after a USB reset")
+        dev.set_configuration()
+        usb.util.claim_interface(dev, self._iface)
+        self._dev = dev
+        self._ensure_idle()
+        try:
+            _, _, state, _ = self.get_status()
+        except Exception:
+            state = None
+        return state
 
     @staticmethod
     def _read_dfu_transfer_size(dev):
@@ -526,10 +576,10 @@ class STM32DFU:
         The bootloader will verify and launch the app if a valid signed image
         exists in the active slot.
         """
-        self.set_address(self.APP_FLASH_START)
-        self._dnload(0, b'')
+        self.set_address(self.DFU_RESET_ADDR)
+        self._dnload(2, b'\x00' * 32)      # any payload: the address is the request
         try:
-            self.get_status()
+            self._poll_idle()
         except Exception:
             pass
 

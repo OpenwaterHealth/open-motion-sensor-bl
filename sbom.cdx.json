@@ -34,7 +34,7 @@
         { "name": "vcs:commit", "value": "8e1819b679f9aa021b741d330b0db0801dd7b0d9" },
         { "name": "boot:crypto-scheme", "value": "SECBOOT_ECCDSA_WITH_AES128_CBC_SHA256" },
         { "name": "boot:slot1", "value": "0x08020000 (512 KiB), execution 0x08020400" },
-        { "name": "boot:config", "value": "dev mode (SECBOOT_DISABLE_SECURITY_IPS) — RDP/WRP/PCROP/MPU isolation not enforced" }
+        { "name": "boot:config", "value": "Release preset (SBSFU_ENABLE_PROTECTIONS=ON): WRP on the bootloader sector, RDP level 1, PCROP on the SE key region, DAP and DMA protection applied by the bootloader at first boot; RDP level 2 (SFU_FINAL_SECURE_LOCK_ENABLE) not yet enabled (tracker T2). Debug preset: development mode (SECBOOT_DISABLE_SECURITY_IPS), option bytes untouched. MPU isolation not used (application runs privileged)." }
       ]
     }
   },
@@ -124,15 +124,15 @@
       "type": "library",
       "bom-ref": "stm32-usb-device-library",
       "name": "STM32 USB Device Library (DFU class)",
-      "version": "unspecified",
+      "version": "2.11.6",
       "group": "STMicroelectronics",
       "supplier": { "name": "STMicroelectronics" },
       "publisher": "STMicroelectronics",
-      "description": "USB device stack; DFU class used for the firmware-install interface. Bundled with X-CUBE-SBSFU 2.8.0; no version macro present in the source tree.",
+      "description": "USB device stack; DFU class used for the firmware-install interface. Core files identical to upstream stm32_mw_usb_device v2.11.6 (includes the usbd_ctlreq.c endpoint-index fix); one documented local change in Class/DFU/Src/usbd_dfu.c, see Middlewares/ST/STM32_USB_Device_Library/LOCAL_CHANGES.md.",
       "licenses": [ { "license": { "name": "STMicroelectronics SLA0044" } } ],
       "purl": "pkg:generic/stmicroelectronics/stm32-usb-device-library",
       "properties": [
-        { "name": "version:source", "value": "unversioned in-tree; ships with X-CUBE-SBSFU 2.8.0" },
+        { "name": "version:source", "value": "diffed against github.com/STMicroelectronics/stm32_mw_usb_device tag v2.11.6 on 2026-10-06" },
         { "name": "class", "value": "DFU" }
       ]
     },
@@ -140,13 +140,13 @@
       "type": "application",
       "bom-ref": "py-cryptography",
       "name": "cryptography",
-      "version": "41.0.7",
+      "version": "50.0.1",
       "group": "PyCA",
       "supplier": { "name": "Python Cryptographic Authority" },
       "scope": "excluded",
       "description": "Off-device firmware signing tool (ECDSA P-256 / AES / SHA-256). Not part of the on-device image.",
       "licenses": [ { "expression": "Apache-2.0 OR BSD-3-Clause" } ],
-      "purl": "pkg:pypi/cryptography@41.0.7",
+      "purl": "pkg:pypi/cryptography@50.0.1",
       "properties": [ { "name": "deployment", "value": "host build/sign tooling" } ]
     },
     {

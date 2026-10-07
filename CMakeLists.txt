@@ -74,12 +74,34 @@ enable_language(C ASM)
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
+# Flash / option-byte protections (WRP, RDP, PCROP, DAP, DMA — see the security
+# block in SBSFU/App/Inc/app_sfu.h). OFF leaves the bootloader in development
+# mode: nothing is written to the option bytes and a debug probe can be attached.
+# ON makes the bootloader apply the protections on its first boot, which sets
+# RDP level 1 and reconfigures the SWD pins; undoing that is a mass erase.
+# The presets set this: Debug OFF, Release ON. RDP level 2 is a separate,
+# deliberate step (SFU_FINAL_SECURE_LOCK_ENABLE, tracker T2) with no CMake switch.
+option(SBSFU_ENABLE_PROTECTIONS "Apply flash/option-byte protections at boot (RDP1, WRP, PCROP, DAP, DMA)" OFF)
+if(SBSFU_ENABLE_PROTECTIONS)
+    set(SBSFU_SECURITY_IPS_DEFINE SECBOOT_ENABLE_SECURITY_IPS)
+    message(STATUS "SBSFU protections: ON  (bootloader will program option bytes: RDP1, WRP, PCROP)")
+else()
+    set(SBSFU_SECURITY_IPS_DEFINE SECBOOT_DISABLE_SECURITY_IPS)
+    message(STATUS "SBSFU protections: OFF (development mode, option bytes untouched)")
+endif()
+
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
+# app_sfu.h is reached from main.h, which the CubeMX object libraries also
+# include (usbd_conf.h), so the define goes on the shared stm32cubemx interface
+# target (the executable links it too) rather than on the executable alone.
+target_compile_definitions(stm32cubemx INTERFACE ${SBSFU_SECURITY_IPS_DEFINE})
 
 # SECoreBin must be built first — it produces SECoreBin.bin which is embedded
 # into the SBSFU firmware via .incbin in sfu_secorebin_Inc.c
 add_subdirectory(SECoreBin)
+# SECoreBin includes app_sfu.h as well and has its own definitions.
+target_compile_definitions(SECoreBin PRIVATE ${SBSFU_SECURITY_IPS_DEFINE})
 
 # Generate sfu_secorebin_Inc.s: embeds SECoreBin.bin into the SE_CORE_Bin section.
 # A dedicated assembly (.s) file is used instead of inline asm in .c because GCC
@@ -165,11 +187,12 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # DEBUG_ENABLED enables SFU_DEBUG_MODE (UART4 trace output: boot banner +
-    # SBSFU state-machine traces). Enabled for ALL build types so the traces are
-    # present in Release too. SFU_DEBUG_MODE only gates tracing and the trace-UART
-    # lifecycle; it does NOT relax any security protection (those are gated by the
-    # separate SFU_*_PROTECT_ENABLE defines).
-    DEBUG_ENABLED
+    # SBSFU state-machine traces) and the main.c status messages. Debug builds
+    # only: a Release image must not carry the traces or their strings
+    # (PTR-2026-1-5 SEN-03 / CVA, tracker T6). SFU_DEBUG_MODE only gates tracing
+    # and the trace-UART lifecycle; the security protections are gated separately
+    # by SBSFU_ENABLE_PROTECTIONS above.
+    $<$<CONFIG:Debug>:DEBUG_ENABLED>
 )
 
 # Remove wrong libob.a library dependency when using cpp files

@@ -138,13 +138,23 @@ re-flashed, so keep release versions increasing.
 
 ## Security configuration status
 
-This build runs in **development mode** (`SECBOOT_DISABLE_SECURITY_IPS`): the
-option-byte protections — **WRP, RDP level 2, PCROP, and the DAP debug lock — are
-NOT enabled.** Firmware signature verification, the SE key-RAM wipe, and the DFU
-read bounds are active. Enabling WRP (write-protect the bootloader + Secure
-Engine), RDP level 2, PCROP on the SE key region, and the DAP lock is required
-before field/production deployment.
+The protections are selected by the CMake preset (`SBSFU_ENABLE_PROTECTIONS`,
+see `CMakeLists.txt` and the security block in `SBSFU/App/Inc/app_sfu.h`):
 
-> **Caution:** enabling the DAP lock or RDP level 2 disconnects the debugger.
-> Apply that pass only after the SWD connection is solid and everything else has
-> been validated.
+| Preset | Protections | Debug probe |
+|---|---|---|
+| `Debug` | Development mode (`SECBOOT_DISABLE_SECURITY_IPS`): option bytes untouched | Usable |
+| `Release` | Applied by the bootloader at its first boot: **WRP** on the bootloader sector, **RDP level 1**, **PCROP** on the Secure Engine key region, **DAP** lock (SWD pins become inputs), **DMA** protection | Not usable; RDP level 1 is reversed only by a mass erase |
+
+Firmware signature verification, the SE key-RAM wipe, the DFU read bounds and
+the pre-erase header check are active in both presets. **RDP level 2**
+(`SFU_FINAL_SECURE_LOCK_ENABLE`) is the production end state but is not yet
+enabled anywhere: it is permanent on the part, so it is a deliberate step
+recorded under tracker T2, not a build option.
+
+> **Caution:** a `Release` build programs the option bytes on the first boot of
+> whatever board it is flashed to. Keep a full flash backup (including the
+> user-config sector) of a bench unit before flashing it, and power-cycle with
+> the probe disconnected afterwards — at RDP level 1 the core cannot execute
+> from flash while a debugger is attached. The protected build has been
+> bench-tested on the console only; the sensor needs its own pass.
