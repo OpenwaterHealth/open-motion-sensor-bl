@@ -67,8 +67,7 @@ python py-tools/export_public_key.py --kms-key ... --check
 
 Replacing the committed public key is a coordinated bootloader release: every
 unit must receive the new bootloader before firmware signed with the new key
-boots on it. Setup, rotation and audit: Open-Motion workspace
-`RUNBOOK-kms-signing-setup.md`.
+boots on it. Setup, rotation and audit: `OpenwaterHealth/OpenWater-KMS` repository, `docs/RUNBOOK-kms-signing-setup.md`.
 
 ### Local test keys (Debug / bench only)
 
