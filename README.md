@@ -1,5 +1,9 @@
 # open-motion-sensor-bl
 
+## Disclaimer
+
+CAUTION - Investigational device. Limited by Federal (or United States) law to investigational use. The system described here has not been evaluated by the FDA and is not designed for the treatment or diagnosis of any disease. It is provided AS-IS, with no warranties. User assumes all liability and responsibility for identifying and mitigating risks associated with using this software.
+
 Secure boot + secure firmware update (SBSFU) bootloader for the **OpenMotion
 sensor module** (STM32H743). On reset it verifies the application image in the
 active slot against an on-chip public key and launches it only if the signature
