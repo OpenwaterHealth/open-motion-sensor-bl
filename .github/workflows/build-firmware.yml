@@ -159,10 +159,15 @@ jobs:
           done
           [ "$missing" -eq 0 ]
 
-      - name: Checksums
+      # The container writes build/ as root, so collect the outputs into a directory the
+      # runner owns before adding checksums.
+      - name: Collect outputs and checksums
         id: sums
         run: |
-          cd "build/${{ steps.cfg.outputs.config }}"
+          set -euo pipefail
+          mkdir -p _out
+          cp "build/${{ steps.cfg.outputs.config }}"/openmotion-bl.{bin,hex,elf} _out/
+          cd _out
           sha256sum openmotion-bl.bin openmotion-bl.hex openmotion-bl.elf > SHA256SUMS
           cat SHA256SUMS
           echo "bin_sha256=$(awk '/openmotion-bl.bin$/{print $1}' SHA256SUMS)" >> "$GITHUB_OUTPUT"
@@ -176,11 +181,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: openmotion-bl-${{ steps.cfg.outputs.config }}
-          path: |
-            build/${{ steps.cfg.outputs.config }}/*.hex
-            build/${{ steps.cfg.outputs.config }}/*.bin
-            build/${{ steps.cfg.outputs.config }}/*.elf
-            build/${{ steps.cfg.outputs.config }}/SHA256SUMS
+          path: _out/*
 
       # ---------------------------
       # Tag builds: publish the binaries to the private artifact bucket.
@@ -204,7 +205,7 @@ jobs:
         run: |
           set -euo pipefail
           DEST="gs://${GCS_BUCKET}/${{ github.event.repository.name }}/${GITHUB_REF_NAME}/"
-          cd "build/${{ steps.cfg.outputs.config }}"
+          cd _out
           gcloud storage cp openmotion-bl.bin openmotion-bl.hex openmotion-bl.elf SHA256SUMS "$DEST"
           echo "Uploaded to $DEST"
 
