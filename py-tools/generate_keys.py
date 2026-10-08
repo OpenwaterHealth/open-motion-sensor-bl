@@ -2,6 +2,12 @@
 """
 generate_keys.py  —  Generate a fresh ECC P-256 key pair + AES-128 key for SBSFU.
 
+LOCAL TEST KEYS ONLY. Production signing keys live in Google Cloud KMS (HSM,
+non-exportable); their public half is fetched with export_public_key.py. Never
+commit a key pair produced here: CI builds SECoreBin from the committed
+py-tools/keys/ecdsa_public.pem, and a test key there ships a bootloader that
+rejects every production image.
+
 Outputs (in py-tools/keys/):
   ecdsa_private.pem   — ECDSA private key (keep SECRET, never commit)
   ecdsa_public.pem    — ECDSA public key  (can be shared / committed)
