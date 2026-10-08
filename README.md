@@ -76,8 +76,7 @@ signed with the matching sensor private key or they are rejected at boot.
   Confirm with `python py-tools/export_public_key.py --kms-key projects/openwater-cloud/locations/us-central1/keyRings/openmotion-firmware/cryptoKeys/sensor-fw-signing/cryptoKeyVersions/1 --check`.
 - The ECDSA **private** key exists only inside the KMS HSM (non-exportable). It is
   never downloaded, never stored in CI, and not needed to build this bootloader.
-  Firmware CI signs through Workload Identity Federation; see the Open-Motion
-  workspace `RUNBOOK-kms-signing-setup.md`.
+  Firmware CI signs through Workload Identity Federation; see the `OpenwaterHealth/OpenWater-KMS` repository, `docs/RUNBOOK-kms-signing-setup.md`.
 - The AES-128 key is kept out of git (CI secret `SECOREBIN_AES_KEY`). The crypto
   scheme embeds it in SECoreBin, but slot images are stored in clear and
   authenticated by signature, so it protects nothing. `se_key.s`, which embeds
