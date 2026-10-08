@@ -1,0 +1,185 @@
+{
+  "description": "Open-Motion sensor secure bootloader (X-CUBE-SBSFU 2.8.0 port for STM32H743VI): ECDSA P-256 / SHA-256 secure boot, USB DFU update with pre-erase header check, anti-rollback floor, RDP level 1 protections.",
+  "components": [
+    {
+      "type": "library",
+      "name": "CMSIS Device STM32H7xx",
+      "supplier": {
+        "name": "STMicroelectronics"
+      },
+      "version": "1.10.7",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "purl": "pkg:github/STMicroelectronics/cmsis-device-h7@v1.10.7",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h7xx.h:104-107"
+        },
+        {
+          "name": "openwater:version-evidence",
+          "value": "no version macro in Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h7xx.h; version from the STM32CubeH7 package the tree was taken from (CVA 2026-09-28)"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "X-CUBE-SBSFU (Secure Boot and Secure Firmware Update, STM32H7 port)",
+      "supplier": {
+        "name": "STMicroelectronics"
+      },
+      "version": "2.8.0",
+      "description": "Secure boot application framework (SBSFU/App, SBSFU/Target, SECoreBin, linker scripts), ported to STM32H743. Crypto scheme SECBOOT_ECCDSA_WITH_AES128_CBC_SHA256.",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "SLA0044"
+          }
+        }
+      ],
+      "purl": "pkg:generic/st/x-cube-sbsfu@2.8.0",
+      "properties": [
+        {
+          "name": "openwater:version-status",
+          "value": "declared in project documentation; not verifiable from the tree"
+        },
+        {
+          "name": "openwater:support-level",
+          "value": "ST lists X-CUBE-SBSFU as legacy (no successor for STM32H743)"
+        },
+        {
+          "name": "openwater:evidence",
+          "value": "SBSFU/, SECoreBin/; version from docs/CYBERSECURITY_510k.md - no version string in the source files"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "STM32 Secure Engine",
+      "supplier": {
+        "name": "STMicroelectronics"
+      },
+      "version": "2.5.4",
+      "description": "Secure Engine core (se_callgate, se_crypto_common, se_fwimg, se_startup, se_user_application, se_utils in SECoreBin; se_interface_* in the bootloader image).",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "SLA0044"
+          }
+        }
+      ],
+      "purl": "pkg:generic/st/stm32-secure-engine@2.5.4",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "Middlewares/ST/STM32_Secure_Engine/Release_Notes.html (v2.5.4, 26-Sep-2025)"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "X-CUBE-CRYPTOLIB (STM32 Cryptographic Library, binary)",
+      "supplier": {
+        "name": "STMicroelectronics"
+      },
+      "version": "3.1.1",
+      "description": "Linked binary libSTM32CryptographicV3.1.1_STM32H7_GCC.a (ECDSA-P256, SHA-256, AES-128-CBC used).",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "SLA0044"
+          }
+        }
+      ],
+      "purl": "pkg:generic/st/x-cube-cryptolib@3.1.1",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "SECoreBin/CMakeLists.txt; Middlewares/ST/STM32_Cryptographic/Fw_Crypto/STM32H7 (V3.1.1, 20-Apr-2018)"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "STM32 USB Device Library (Core + DFU class)",
+      "supplier": {
+        "name": "STMicroelectronics"
+      },
+      "version": "2.11.6",
+      "description": "USB device stack. Includes the v2.11.6 usbd_ctlreq.c endpoint-index and USBD_GetString bounds fixes (CVA R7).",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "SLA0044"
+          }
+        }
+      ],
+      "purl": "pkg:github/STMicroelectronics/stm32-mw-usb-device@v2.11.6",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "Middlewares/ST/STM32_USB_Device_Library; Core files are byte-identical to upstream v2.11.6 (diffed against the tag on 2026-10-06); the one local change (manifestation-tolerant DFU descriptor in Class/DFU/Src/usbd_dfu.c) is recorded in LOCAL_CHANGES.md"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "STM32CubeMX generated startup and system code",
+      "supplier": {
+        "name": "STMicroelectronics"
+      },
+      "version": "6.18.0",
+      "description": "startup_stm32h743xx.s, system_stm32h7xx.c, syscalls.c, sysmem.c, USB_DEVICE glue.",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "purl": "pkg:generic/st/stm32cubemx-generated-code@6.18.0",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "*.ioc (CubeMX 6.18.0)"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "newlib-nano (libc, libm) and libgcc",
+      "supplier": {
+        "name": "Arm / Red Hat (newlib), FSF (libgcc)"
+      },
+      "version": "4.5.0",
+      "description": "C runtime linked statically from Arm GNU Toolchain 15.2.Rel1 (--specs=nano.specs, -lm).",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "newlib licenses (BSD-style) / GPL-3.0 with GCC runtime exception"
+          }
+        }
+      ],
+      "cpe": "cpe:2.3:a:newlib_project:newlib:4.5.0:*:*:*:*:*:*:*",
+      "properties": [
+        {
+          "name": "openwater:evidence",
+          "value": "cmake/gcc-arm-none-eabi.cmake; toolchain 15.2.Rel1 ships newlib 4.5.0"
+        }
+      ]
+    }
+  ],
+  "_note": "Reviewed static components. Versions that are machine-readable in the tree (HAL, CMSIS, toolchain, build image, bundled bootloader, signing key) are added by scripts/gen_sbom.py at build time and must not be listed here."
+}

@@ -173,8 +173,19 @@ jobs:
           for ext in bin hex elf; do
             cp "build/${{ steps.cfg.outputs.config }}/openmotion-bl.$ext" "_out/$NAME.$ext"
           done
+          # Build-time SBOM (CycloneDX 1.6): HAL/CMSIS versions from the tree, reviewed
+          # static components from scripts/sbom-manifest.json, toolchain and build image as
+          # built, and the public key this bootloader trusts.
+          TOOLCHAIN="$(docker run --rm ghcr.io/openwaterhealth/stm32-build-env:latest arm-none-eabi-gcc --version | head -1)"
+          IMAGE="$(docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/openwaterhealth/stm32-build-env:latest 2>/dev/null || echo ghcr.io/openwaterhealth/stm32-build-env:latest)"
+          python3 scripts/gen_sbom.py --root . --manifest scripts/sbom-manifest.json \
+            --name "${{ github.event.repository.name }}" --version "$GITHUB_REF_NAME" \
+            --config "${{ steps.cfg.outputs.config }}" --toolchain "$TOOLCHAIN" --build-image "$IMAGE" \
+            --property "openwater:trusted-public-key-sha256=${{ steps.pubkey.outputs.fingerprint }}" \
+            --property "openwater:kms-key-version=$KMS_KEY_VERSION" \
+            -o "_out/$NAME.cdx.json"
           cd _out
-          sha256sum "$NAME.bin" "$NAME.hex" "$NAME.elf" > SHA256SUMS
+          sha256sum "$NAME.bin" "$NAME.hex" "$NAME.elf" "$NAME.cdx.json" > SHA256SUMS
           cat SHA256SUMS
           echo "bin_sha256=$(awk -v f="$NAME.bin" '$2==f{print $1}' SHA256SUMS)" >> "$GITHUB_OUTPUT"
 
@@ -215,7 +226,7 @@ jobs:
           # The uploader holds objectCreator only (write-once, no read). A folder-style
           # destination makes gcloud GET the prefix first, which is denied; copy each file
           # to its exact object name instead.
-          for f in "${{ steps.sums.outputs.name }}".bin "${{ steps.sums.outputs.name }}".hex "${{ steps.sums.outputs.name }}".elf SHA256SUMS; do
+          for f in "${{ steps.sums.outputs.name }}".bin "${{ steps.sums.outputs.name }}".hex "${{ steps.sums.outputs.name }}".elf "${{ steps.sums.outputs.name }}".cdx.json SHA256SUMS; do
             gcloud storage cp "$f" "${DEST}${f}"
           done
           echo "Uploaded to $DEST"
@@ -269,7 +280,7 @@ jobs:
           echo "**${{ steps.sums.outputs.name }}.bin SHA-256:** \`${{ steps.sums.outputs.bin_sha256 }}\`" >> notes.md
           echo "**Binaries:** \`gs://${GCS_BUCKET}/${{ github.event.repository.name }}/${GITHUB_REF_NAME}/\` (private; access via Openwater Google Cloud)" >> notes.md
 
-      # The release carries notes and the SBOM only. Binaries are in the private
+      # The release carries notes and the build-time SBOM only. Binaries are in the private
       # bucket (plan D7); the firmware CI fetches them with its own federated identity.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -282,4 +293,4 @@ jobs:
           overwrite_files: true
           make_latest: ${{ steps.reltype.outputs.prerelease == 'false' }}
           files: |
-            sbom.cdx.json
+            _out/${{ steps.sums.outputs.name }}.cdx.json
