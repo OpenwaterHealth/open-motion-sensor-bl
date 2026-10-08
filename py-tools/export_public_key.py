@@ -66,10 +66,13 @@ def main() -> None:
         ap.error("--kms-key must name a key VERSION (.../cryptoKeyVersions/<n>)")
 
     client = kms.KeyManagementServiceClient()
-    meta = client.get_crypto_key_version(request={"name": args.kms_key})
-    if meta.algorithm != kms.CryptoKeyVersion.CryptoKeyVersionAlgorithm.EC_SIGN_P256_SHA256:
-        sys.exit(f"ERROR: key algorithm is {meta.algorithm.name}, expected EC_SIGN_P256_SHA256")
-    pem = client.get_public_key(request={"name": args.kms_key}).pem.encode()
+    # GetPublicKey only: roles/cloudkms.publicKeyViewer grants viewPublicKey, not
+    # cryptoKeyVersions.get, so GetCryptoKeyVersion would be denied. The response
+    # carries algorithm and protection level, and fails for a non-ENABLED version.
+    resp = client.get_public_key(request={"name": args.kms_key})
+    if resp.algorithm != kms.CryptoKeyVersion.CryptoKeyVersionAlgorithm.EC_SIGN_P256_SHA256:
+        sys.exit(f"ERROR: key algorithm is {resp.algorithm.name}, expected EC_SIGN_P256_SHA256")
+    pem = resp.pem.encode()
 
     pub = serialization.load_pem_public_key(pem)
     if not isinstance(pub, ec.EllipticCurvePublicKey) or not isinstance(pub.curve, ec.SECP256R1):
@@ -77,7 +80,7 @@ def main() -> None:
     n = pub.public_numbers()
 
     print(f"[export_public_key] Key version : {args.kms_key}")
-    print(f"[export_public_key] State/level : {meta.state.name} / {meta.protection_level.name}")
+    print(f"[export_public_key] Level       : {resp.protection_level.name}")
     print(f"[export_public_key] Fingerprint : sha256:{spki_fingerprint(pem)}  (DER SubjectPublicKeyInfo)")
     print(f"[export_public_key] X           : {n.x.to_bytes(32, 'big').hex()}")
     print(f"[export_public_key] Y           : {n.y.to_bytes(32, 'big').hex()}")
