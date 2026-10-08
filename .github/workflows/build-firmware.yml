@@ -212,7 +212,12 @@ jobs:
           set -euo pipefail
           DEST="gs://${GCS_BUCKET}/${{ github.event.repository.name }}/${GITHUB_REF_NAME}/"
           cd _out
-          gcloud storage cp "${{ steps.sums.outputs.name }}".bin "${{ steps.sums.outputs.name }}".hex "${{ steps.sums.outputs.name }}".elf SHA256SUMS "$DEST"
+          # The uploader holds objectCreator only (write-once, no read). A folder-style
+          # destination makes gcloud GET the prefix first, which is denied; copy each file
+          # to its exact object name instead.
+          for f in "${{ steps.sums.outputs.name }}".bin "${{ steps.sums.outputs.name }}".hex "${{ steps.sums.outputs.name }}".elf SHA256SUMS; do
+            gcloud storage cp "$f" "${DEST}${f}"
+          done
           echo "Uploaded to $DEST"
 
       - name: Detect release type
