@@ -37,6 +37,7 @@ from verify_firmware import (
     read_header_version,
     verify_image,
 )
+import migrate
 
 
 # ── defaults ─────────────────────────────────────────────────────────────────
@@ -257,9 +258,12 @@ def main():
     sub.add_parser("version", aliases=["dfu_ver"],
                    help="Read the bootloader version (FW_VERSION) over DFU")
 
+    # enter-dfu / migrate (console fleet migration to bootloader 1.2.0; see migrate.py)
+    migrate.add_subcommands(sub)
+
     # Make 'flash' the default sub-command so a bare image path works:
     #   python flash_firmware.py app_signed.bin
-    known = {"list", "flash", "read", "erase", "leave", "version", "dfu_ver"}
+    known = {"list", "flash", "read", "erase", "leave", "version", "dfu_ver", "enter-dfu", "migrate"}
     argv = list(sys.argv[1:])
     i = 0
     first_pos = None
@@ -288,7 +292,10 @@ def main():
         "version": cmd_version,
         "dfu_ver": cmd_version,
     }
-    dispatch[args.command](args)
+    if getattr(args, "func", None):
+        args.func(args)
+    else:
+        dispatch[args.command](args)
 
 
 if __name__ == "__main__":

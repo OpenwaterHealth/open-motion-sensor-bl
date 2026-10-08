@@ -1,5 +1,6 @@
 cryptography==50.0.1
 pyusb>=1.2.1
+pyserial>=3.5          # flash_firmware.py enter-dfu / migrate (console CDC command port)
 # Production signing backend (sign_firmware.py --kms-key, export_public_key.py).
 # Not needed to build the bootloader or to flash; needed only where images are signed.
 google-cloud-kms==3.18.0

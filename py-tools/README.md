@@ -386,6 +386,47 @@ It is reported in two places:
 
 ---
 
+## 8. Migrating fielded sensor modules to bootloader 1.2.0
+
+Units in the field run bootloader **1.1.0** (RDP 0, old signing key). Bootloader 1.2.0
+trusts only the Google Cloud KMS key, so a unit must get the new bootloader before any
+clinical image will run on it. `flash_firmware.py migrate` does the whole sequence over
+USB, no case opening (the sensor's command channel is bulk USB on interface 0 of 0483:5A5A;
+`--product sensor` forces it, `--app-serial` picks one module when several are attached):
+
+```sh
+# inputs come from the private bucket gs://openwater-firmware-artifacts
+#   open-motion-sensor-bl-updater/<tag>/open-motion-sensor-bl-updater-<tag>-bl<bl>-signed.bin
+#   openmotion-sensor-fw/<tag>/openmotion-sensor-fw-<tag>-signed.bin
+python flash_firmware.py migrate \
+    --updater open-motion-sensor-bl-updater-1.8.98-bl1.2.0-rc.1-signed.bin \
+    --signed  openmotion-sensor-fw-<tag>-signed.bin --product sensor --yes
+```
+
+What happens, by starting state (the tool detects it):
+
+| Found | Steps |
+|---|---|
+| sensor application on USB (0483:5A5A) | `OW_CMD_DFU` over bulk interface 0, then as below |
+| DFU, bootloader `1.0.x`/`1.1.x` | erase the slot, flash the **updater** (old key). The updater rewrites sector 0 with bootloader 1.2.0, erases the slot and the shared floor sector and resets into its DFU; the tool waits for it, checks `version` is `1.2.x`, then flashes the **signed application** (new key). |
+| DFU, bootloader `1.2.x` | flash the signed application only |
+| DFU, STM32 ROM loader (bare-metal unit) | needs `--production <bootloader+app>`: erase sectors 0-5, write it at `0x08000000`, leave DFU. Not yet exercised on hardware. |
+
+Both images are verified on the host first: the updater against `keys/ecdsa_public_legacy_1.1.0.pem`
+(what 1.0.0 and 1.1.0 trust), the application against `keys/ecdsa_public.pem`. With `--production` the
+tool also checks that the updater embeds the same bootloader the production image carries.
+
+Rules on the bench and in the field: powered, do not unplug USB, one module in DFU at a time.
+The single LED (PC14) is on while the updater runs and blinks forever if the sector-0 rewrite
+failed (SWD recovery). The updater refuses, without touching
+sector 0, if the option bytes are not in the fielded state (RDP 0, no WRP, no PCROP); the unit
+then comes back in the old bootloader's DFU.
+
+`python flash_firmware.py enter-dfu` alone puts a running module into DFU and prints the
+bootloader version and DFU flavour. Windows needs the WinUSB driver (Zadig) on the DFU
+device and on the sensor's composite device (the SDK uses the same binding). Design: `PLAN-console-migration.md`;
+updater source: `open-motion-sensor-bl-updater` (mirror of the console updater).
+
 ## Flash memory map
 
 Defined in `Core/Inc/memory_map.h` (single source of truth). 2 MB flash, 16 × 128 KB sectors:

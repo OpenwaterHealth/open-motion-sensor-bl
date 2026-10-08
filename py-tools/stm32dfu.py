@@ -18,6 +18,7 @@ Windows driver note:
     STM32CubeProgrammer (see _CUBEPROG_LIBUSB_PATHS below).
 """
 
+import re
 import struct
 import time
 import sys
@@ -94,6 +95,30 @@ class DFUStatus:
 
 class DFUError(Exception):
     pass
+
+
+# ── DFU flavour detection ────────────────────────────────────────────────────
+# A console in DFU is either our secure bootloader (one alt setting whose DfuSe
+# descriptor has read-only 'a' runs) or the STM32 ROM loader of a bare-metal unit
+# (four alts: Internal Flash, Option Bytes, OTP Memory, Device Feature). Same
+# VID/PID, so only the alt-setting strings tell them apart. Mirrors the SDK's
+# omotion/boot_mode.py.
+ROM_ONLY_ALTS = ("option bytes", "otp memory", "device feature")
+ROM_FLASH_START = 0x08000000
+ROM_FLASH_END   = 0x08200000
+_SECTOR_RUN_RE  = re.compile(r"\d+\s*\*\s*\d+\s*[KMB]?\s*([a-g])")
+
+
+def classify_alt_names(names):
+    """'bootloader' | 'rom' | 'unknown' from the interface-0 alt-setting strings."""
+    names = [n for n in (names or []) if n]
+    if not names:
+        return "unknown"
+    if any(m in n.lower() for n in names for m in ROM_ONLY_ALTS):
+        return "rom"
+    if len(names) == 1 and any(a == "a" for a in _SECTOR_RUN_RE.findall(names[0])):
+        return "bootloader"
+    return "unknown"
 
 
 # ── libusb backend discovery ─────────────────────────────────────────────────
@@ -186,6 +211,11 @@ class STM32DFU:
         self.xfer_size = xfer_size
         self._dev      = None
         self._iface    = 0
+        # Writable window. Defaults to the secure bootloader's slot; set_rom_mode()
+        # widens it for the STM32 ROM loader (bare-metal units).
+        self.flash_start = self.APP_FLASH_START
+        self.flash_end   = self.APP_FLASH_END
+        self.rom_mode    = False
 
     # ── context manager ──────────────────────────────────────────────────────
 
@@ -224,6 +254,81 @@ class STM32DFU:
                 "address": dev.address,
             })
         return result
+
+    @classmethod
+    def wait_for_device(cls, timeout_s, present=True, serial=None):
+        """Poll until a DFU device is present (or absent). Returns True on success."""
+        backend = _find_libusb()
+        deadline = time.monotonic() + timeout_s
+        while True:
+            devs = list(usb.core.find(idVendor=cls.STM32_VID, idProduct=cls.STM32_PID,
+                                      find_all=True, backend=backend) or [])
+            if serial:
+                keep = []
+                for d in devs:
+                    try:
+                        if usb.util.get_string(d, d.iSerialNumber) == serial:
+                            keep.append(d)
+                    except Exception:
+                        pass
+                devs = keep
+            if bool(devs) == present:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.25)
+
+    def alt_setting_names(self):
+        """Interface-0 alt-setting strings of the connected device."""
+        names = []
+        try:
+            cfg = self._dev.get_active_configuration()
+        except Exception:
+            return names
+        for intf in cfg:
+            if intf.bInterfaceNumber != self._iface:
+                continue
+            try:
+                names.append(usb.util.get_string(self._dev, intf.iInterface) if intf.iInterface else "")
+            except Exception:
+                names.append("")
+        return names
+
+    def detect_mode(self):
+        """('bootloader' | 'rom' | 'unknown', alt-setting names) for the connected device."""
+        names = self.alt_setting_names()
+        return classify_alt_names(names), names
+
+    def set_rom_mode(self):
+        """Address the STM32 ROM loader: alt 0 (Internal Flash), whole-flash window.
+
+        Only valid after detect_mode() returned 'rom'. The caller erases and writes a
+        production image (bootloader + application) at 0x08000000.
+        """
+        try:
+            self._dev.set_interface_altsetting(interface=self._iface, alternate_setting=0)
+        except Exception:
+            pass
+        self.flash_start = ROM_FLASH_START
+        self.flash_end   = ROM_FLASH_END
+        self.rom_mode    = True
+
+    def erase_range(self, start, end, progress_cb=None):
+        """Erase every 128 KB sector in [start, end) within the writable window."""
+        if start < self.flash_start or end > self.flash_end or start >= end:
+            raise DFUError(f"Erase range {start:#010x}..{end:#010x} outside the writable window "
+                           f"{self.flash_start:#010x}..{self.flash_end:#010x}")
+        sectors = list(range((start // self.FLASH_SECTOR_SIZE) * self.FLASH_SECTOR_SIZE, end,
+                             self.FLASH_SECTOR_SIZE))
+        for i, sec in enumerate(sectors):
+            msg = f"Erasing sector {i + 1}/{len(sectors)} @ {sec:#010x}"
+            if progress_cb:
+                progress_cb(i, len(sectors), msg)
+            else:
+                print(f"  {msg}")
+            self.erase_sector(sec)
+        if progress_cb:
+            progress_cb(len(sectors), len(sectors))
 
     # ── connect / disconnect ─────────────────────────────────────────────────
 
@@ -419,9 +524,9 @@ class STM32DFU:
                          ``done`` counts sectors completed; ``total`` is the
                          total number of sectors to erase.
         """
-        sector = self.APP_FLASH_START
+        sector = self.flash_start
         sectors = []
-        while sector < self.APP_FLASH_END:
+        while sector < self.flash_end:
             sectors.append(sector)
             sector += self.FLASH_SECTOR_SIZE
 
@@ -441,7 +546,7 @@ class STM32DFU:
 
     # ── high-level operations ────────────────────────────────────────────────
 
-    def download(self, address, data, progress_cb=None):
+    def download(self, address, data, progress_cb=None, pre_erased=False):
         """
         Erase affected flash sectors and write `data` starting at `address`.
 
@@ -461,18 +566,18 @@ class STM32DFU:
         if total == 0:
             raise ValueError("Empty firmware image")
 
-        if address < self.APP_FLASH_START or (address + total) > self.APP_FLASH_END:
+        if address < self.flash_start or (address + total) > self.flash_end:
             raise DFUError(
                 f"Target range {address:#010x}..{address + total:#010x} is outside the "
-                f"bootloader's writable region {self.APP_FLASH_START:#010x}.."
-                f"{self.APP_FLASH_END:#010x} (sector 0 holds the read-only bootloader).")
+                f"writable region {self.flash_start:#010x}.."
+                f"{self.flash_end:#010x} (sector 0 holds the read-only bootloader).")
 
-        # ── erase affected sectors ──────────────────────────────────────────
+        # ── erase affected sectors (unless the caller already did) ──────────
         sector_start = (address // self.FLASH_SECTOR_SIZE) * self.FLASH_SECTOR_SIZE
         end_address  = address + total
         sectors = []
         s = sector_start
-        while s < end_address:
+        while s < end_address and not pre_erased:
             sectors.append(s)
             s += self.FLASH_SECTOR_SIZE
 
@@ -546,6 +651,8 @@ class STM32DFU:
         Read the bootloader version string (FW_VERSION) via the virtual DFU
         version address. Returns the decoded string with null padding stripped.
         """
+        if self.rom_mode:
+            raise DFUError("the STM32 ROM loader has no version string (bare-metal unit)")
         raw = self.upload(self.DFU_VERSION_ADDR, self.DFU_VERSION_LEN)
         return raw.split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
 
@@ -576,6 +683,16 @@ class STM32DFU:
         The bootloader will verify and launch the app if a valid signed image
         exists in the active slot.
         """
+        if self.rom_mode:
+            # DfuSe manifestation as dfu-util's ":leave" does it: address pointer at the
+            # image base, then a zero-length DNLOAD; the ROM loader jumps to the image.
+            self.set_address(ROM_FLASH_START)
+            self._dnload(0, b'')
+            try:
+                self.get_status()
+            except Exception:
+                pass
+            return
         self.set_address(self.DFU_RESET_ADDR)
         self._dnload(2, b'\x00' * 32)      # any payload: the address is the request
         try:
