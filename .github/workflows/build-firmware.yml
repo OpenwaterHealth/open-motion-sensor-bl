@@ -19,7 +19,7 @@ permissions:
 
 env:
   # Private artifact store for bootloader binaries (plan D7: the binary is no
-  # longer a public release asset). Layout: gs://<bucket>/<repo>/<tag>/...
+  # longer a public release asset). Layout: gs://<bucket>/<repo>/<tag>/<repo>-<tag>.{bin,hex,elf} + SHA256SUMS
   GCS_BUCKET: openwater-firmware-artifacts
   WIF_PROVIDER: projects/341318872140/locations/global/workloadIdentityPools/github/providers/github-oidc
   UPLOADER_SA: sa-bl-artifact-uploader@openwater-cloud.iam.gserviceaccount.com
@@ -160,17 +160,23 @@ jobs:
           [ "$missing" -eq 0 ]
 
       # The container writes build/ as root, so collect the outputs into a directory the
-      # runner owns before adding checksums.
+      # runner owns before adding checksums. Files are named <repository>-<ref>.<ext>
+      # (e.g. open-motion-console-bl-1.2.0-rc.0.bin) so a stored binary is unambiguous
+      # on its own, and nothing in the bucket is ever overwritten or shadowed.
       - name: Collect outputs and checksums
         id: sums
         run: |
           set -euo pipefail
+          NAME="${{ github.event.repository.name }}-$(echo "$GITHUB_REF_NAME" | tr '/' '-')"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
           mkdir -p _out
-          cp "build/${{ steps.cfg.outputs.config }}"/openmotion-bl.{bin,hex,elf} _out/
+          for ext in bin hex elf; do
+            cp "build/${{ steps.cfg.outputs.config }}/openmotion-bl.$ext" "_out/$NAME.$ext"
+          done
           cd _out
-          sha256sum openmotion-bl.bin openmotion-bl.hex openmotion-bl.elf > SHA256SUMS
+          sha256sum "$NAME.bin" "$NAME.hex" "$NAME.elf" > SHA256SUMS
           cat SHA256SUMS
-          echo "bin_sha256=$(awk '/openmotion-bl.bin$/{print $1}' SHA256SUMS)" >> "$GITHUB_OUTPUT"
+          echo "bin_sha256=$(awk -v f="$NAME.bin" '$2==f{print $1}' SHA256SUMS)" >> "$GITHUB_OUTPUT"
 
       # Debug builds (branch pushes, dispatch, *-dev.* tags) stay available as a
       # workflow artifact for developers. Release builds (rc / final tags) are
@@ -180,7 +186,7 @@ jobs:
         if: steps.cfg.outputs.config == 'Debug'
         uses: actions/upload-artifact@v4
         with:
-          name: openmotion-bl-${{ steps.cfg.outputs.config }}
+          name: ${{ steps.sums.outputs.name }}-${{ steps.cfg.outputs.config }}
           path: _out/*
 
       # ---------------------------
@@ -206,7 +212,7 @@ jobs:
           set -euo pipefail
           DEST="gs://${GCS_BUCKET}/${{ github.event.repository.name }}/${GITHUB_REF_NAME}/"
           cd _out
-          gcloud storage cp openmotion-bl.bin openmotion-bl.hex openmotion-bl.elf SHA256SUMS "$DEST"
+          gcloud storage cp "${{ steps.sums.outputs.name }}".bin "${{ steps.sums.outputs.name }}".hex "${{ steps.sums.outputs.name }}".elf SHA256SUMS "$DEST"
           echo "Uploaded to $DEST"
 
       - name: Detect release type
@@ -255,7 +261,7 @@ jobs:
           echo "**Build Time:** ${{ steps.buildmeta.outputs.datetime }}" >> notes.md
           echo "**Build Config:** ${{ steps.cfg.outputs.config }}" >> notes.md
           echo "**Trusted signing key (SHA-256 of public key):** \`${{ steps.pubkey.outputs.fingerprint }}\`" >> notes.md
-          echo "**openmotion-bl.bin SHA-256:** \`${{ steps.sums.outputs.bin_sha256 }}\`" >> notes.md
+          echo "**${{ steps.sums.outputs.name }}.bin SHA-256:** \`${{ steps.sums.outputs.bin_sha256 }}\`" >> notes.md
           echo "**Binaries:** \`gs://${GCS_BUCKET}/${{ github.event.repository.name }}/${GITHUB_REF_NAME}/\` (private; access via Openwater Google Cloud)" >> notes.md
 
       # The release carries notes and the SBOM only. Binaries are in the private
