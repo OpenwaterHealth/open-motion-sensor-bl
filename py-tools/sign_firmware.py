@@ -259,15 +259,17 @@ class KmsSigner:
                 "(.../cryptoKeys/<key>/cryptoKeyVersions/<n>), got: " + key_version)
         self._client = kms.KeyManagementServiceClient()
         self._key_version = key_version
-        meta = self._client.get_crypto_key_version(request={"name": key_version})
+        # Only GetPublicKey and AsymmetricSign: roles/cloudkms.signerVerifier (and
+        # publicKeyViewer) grant viewPublicKey but NOT cryptoKeyVersions.get, so no
+        # GetCryptoKeyVersion call here. GetPublicKey already reports algorithm and
+        # protection level, and fails for a version that is not ENABLED.
+        pub = self._client.get_public_key(request={"name": key_version})
         algo = kms.CryptoKeyVersion.CryptoKeyVersionAlgorithm
-        if meta.algorithm != algo.EC_SIGN_P256_SHA256:
-            raise ValueError(f"KMS key version algorithm is {meta.algorithm.name}, "
+        if pub.algorithm != algo.EC_SIGN_P256_SHA256:
+            raise ValueError(f"KMS key version algorithm is {pub.algorithm.name}, "
                              "expected EC_SIGN_P256_SHA256")
-        if meta.state != kms.CryptoKeyVersion.CryptoKeyVersionState.ENABLED:
-            raise ValueError(f"KMS key version is {meta.state.name}, not ENABLED")
-        self.protection_level = meta.protection_level.name
-        self._pub_pem = self._client.get_public_key(request={"name": key_version}).pem.encode()
+        self.protection_level = pub.protection_level.name
+        self._pub_pem = pub.pem.encode()
 
     def public_key_pem(self) -> bytes:
         return self._pub_pem
