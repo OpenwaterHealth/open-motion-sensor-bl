@@ -23,6 +23,10 @@ env:
   GCS_BUCKET: openwater-firmware-artifacts
   WIF_PROVIDER: projects/341318872140/locations/global/workloadIdentityPools/github/providers/github-oidc
   UPLOADER_SA: sa-bl-artifact-uploader@openwater-cloud.iam.gserviceaccount.com
+  # Read-only identity (roles/cloudkms.publicKeyViewer on the key ring, nothing else)
+  # used on every build to confirm that the committed public key IS the KMS key.
+  PUBKEY_READER_SA: sa-bl-pubkey-reader@openwater-cloud.iam.gserviceaccount.com
+  KMS_KEY_VERSION: projects/openwater-cloud/locations/us-central1/keyRings/openmotion-firmware/cryptoKeys/sensor-fw-signing/cryptoKeyVersions/1
 
 jobs:
   build:
@@ -107,6 +111,24 @@ jobs:
           FP=$(openssl pkey -pubin -in py-tools/keys/ecdsa_public.pem -outform DER | openssl dgst -sha256 | awk '{print $2}')
           echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
           echo "Trusted signing key: sha256:$FP"
+
+      # ---------------------------
+      # Integrity check of the committed public key: fetch the public half of the
+      # production signing key from Cloud KMS and fail the build if it is not the
+      # PEM we just compiled in. Read-only federated identity; no stored credential.
+      # Guards against a wrong or tampered PEM shipping in a bootloader.
+      # ---------------------------
+      - name: Authenticate to Google Cloud (public-key reader)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.PUBKEY_READER_SA }}
+
+      - name: Verify committed public key against Cloud KMS
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check -r py-tools/requirements.txt
+          python3 py-tools/export_public_key.py --kms-key "$KMS_KEY_VERSION" \
+            --output py-tools/keys/ecdsa_public.pem --check
 
       - name: Pull build image
         run: docker pull ghcr.io/openwaterhealth/stm32-build-env:latest
