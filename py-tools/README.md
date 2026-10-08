@@ -47,24 +47,52 @@ pip install -r requirements.txt   # cryptography, pyusb
 
 ---
 
-## 2. Generate keys  *(once per device family)*
+## 2. Keys
+
+### Production: Google Cloud KMS
+
+The production signing key for each product is an ECDSA P-256 key in Google
+Cloud KMS (project `openwater-cloud`, key ring `openmotion-firmware`,
+`us-central1`, HSM protection level, non-exportable). Nobody holds the private
+key; CI signs through Workload Identity Federation. Only the public half is
+needed here, committed as `py-tools/keys/ecdsa_public.pem`:
 
 ```sh
-# From repo root, with the .venv active:
+# needs roles/cloudkms.publicKeyViewer and:  gcloud auth application-default login
+python py-tools/export_public_key.py \
+    --kms-key projects/openwater-cloud/locations/us-central1/keyRings/openmotion-firmware/cryptoKeys/<product>-fw-signing/cryptoKeyVersions/<n>
+# or only confirm that the committed PEM matches the KMS key:
+python py-tools/export_public_key.py --kms-key ... --check
+```
+
+Replacing the committed public key is a coordinated bootloader release: every
+unit must receive the new bootloader before firmware signed with the new key
+boots on it. Setup, rotation and audit: Open-Motion workspace
+`RUNBOOK-kms-signing-setup.md`.
+
+### Local test keys (Debug / bench only)
+
+```sh
 python py-tools/generate_keys.py          # add --force to overwrite existing keys
 ```
 
-What it does:
-- Generates an **ECDSA P-256** key pair and a **16-byte AES-128** key.
-- Writes to `py-tools/keys/`:
-  - `ecdsa_private.pem` — **keep secret, never commit**
-  - `ecdsa_public.pem`, `pub_key_x.bin`, `pub_key_y.bin`
-  - `aes128.bin` — **keep secret, never commit**
-- Rewrites `SECoreBin/Startup/se_key.s` with the public key + AES key embedded
-  as ARM MOVW/MOVT instructions (commit this file).
+- Generates an **ECDSA P-256** key pair and a **16-byte AES-128** key into
+  `py-tools/keys/`: `ecdsa_private.pem` and `aes128.bin` (**never commit**),
+  `ecdsa_public.pem`, `pub_key_x.bin`, `pub_key_y.bin`.
+- Rewrites `SECoreBin/Startup/se_key.s` (`.gitignore`d) with the public key and
+  AES key embedded as ARM MOVW/MOVT instructions.
 
-> Regenerating keys invalidates all previously signed firmware. **Rebuild the
-> bootloader (step 3)** afterwards so the new public key is embedded in SECoreBin.
+A bootloader built from local test keys accepts only images signed with that
+test private key. **Do not commit a test `ecdsa_public.pem`**: CI builds
+SECoreBin from the committed PEM, and a test key there ships a bootloader that
+rejects every production image.
+
+### AES key
+
+SECoreBin embeds an AES-128 key because the selected crypto scheme
+(`SECBOOT_ECCDSA_WITH_AES128_CBC_SHA256`) defines one, but slot images are
+stored in clear and authenticated by signature, so the AES key protects nothing
+and is not needed to sign. CI takes it from the `SECOREBIN_AES_KEY` secret.
 
 ---
 
@@ -153,11 +181,22 @@ arm-none-eabi-objdump -h build/Debug/your_app.elf | grep isr_vector
 
 ## 6. Sign the application
 
+Production (CI, Google Cloud KMS; needs `roles/cloudkms.signerVerifier`):
+
+```sh
+python py-tools/sign_firmware.py \
+    --firmware path/to/your_app.bin \
+    --kms-key  projects/openwater-cloud/locations/us-central1/keyRings/openmotion-firmware/cryptoKeys/<product>-fw-signing/cryptoKeyVersions/<n> \
+    --version  1.0.0 \
+    --output   your_app_signed.bin
+```
+
+Bench (Debug bootloader built from local test keys):
+
 ```sh
 python py-tools/sign_firmware.py \
     --firmware    path/to/your_app.bin \
     --private-key py-tools/keys/ecdsa_private.pem \
-    --aes-key     py-tools/keys/aes128.bin \
     --version     1.0.0 \
     --output      your_app_signed.bin
 ```
@@ -165,8 +204,9 @@ python py-tools/sign_firmware.py \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--firmware` | *(required)* | Raw `.bin` built for `0x08020400` (step 5) |
-| `--private-key` | `py-tools/keys/ecdsa_private.pem` | ECDSA P-256 private key |
-| `--aes-key` | `py-tools/keys/aes128.bin` | Raw 16-byte AES-128 key |
+| `--kms-key` | — | Google Cloud KMS crypto key **version** resource name; uses Application Default Credentials. Mutually exclusive with `--private-key` |
+| `--private-key` | `py-tools/keys/ecdsa_private.pem` | Local ECDSA P-256 private key (test keys only) |
+| `--aes-key` | — | Optional and unused for signing (the body is stored in clear); accepted for compatibility |
 | `--version` | `0.0.1` | Firmware version, dotted semver `MAJOR.MINOR.PATCH`, encoded as `major*10000 + minor*100 + patch` (a raw uint16 is also accepted) — see [Firmware versioning & anti-rollback](#firmware-versioning--anti-rollback) |
 | `--output` | `<firmware>_signed.bin` | Output path |
 
@@ -381,20 +421,22 @@ Addr range              Size   Sct   Region            DFU access
 
 ```
 py-tools/
-  generate_keys.py     Generate ECC P-256 + AES-128 keys, update se_key.s
+  generate_keys.py     Generate LOCAL TEST ECC P-256 + AES-128 keys, update se_key.s
+  export_public_key.py Fetch the production public key from Google Cloud KMS (or --check it)
   gen_se_key_s.py      Low-level: raw key bytes -> ARM MOVW/MOVT asm
-  sign_firmware.py     Sign + format an application image for the active slot
+  sign_firmware.py     Sign + format an application image (--kms-key or local --private-key)
   verify_firmware.py   Check a signed image on the host before flashing it
   flash_firmware.py    Pure-Python USB DFU installer (uses stm32dfu.py)
   stm32dfu.py          Pure-Python STM32 DfuSe protocol (pyusb)
-  requirements.txt     cryptography, pyusb
+  requirements.txt     cryptography, pyusb, google-cloud-kms
   keys/
-    ecdsa_private.pem  PRIVATE — never commit
-    ecdsa_public.pem, pub_key_x.bin, pub_key_y.bin
+    ecdsa_private.pem  local TEST key only — PRIVATE, never commit (production key is in KMS)
+    ecdsa_public.pem   committed; public half of the KMS production key
+    pub_key_x.bin, pub_key_y.bin
     aes128.bin         PRIVATE — never commit
 
 SECoreBin/Startup/
-  se_key.s             Auto-generated by generate_keys.py — commit this
+  se_key.s             Generated (generate_keys.py locally, CI from the secret) — .gitignored
 ```
 
 ---
@@ -402,7 +444,7 @@ SECoreBin/Startup/
 ## Quick reference
 
 ```sh
-# one-time
+# one-time, bench only: LOCAL TEST keys (the production public key comes from KMS, see §2)
 python py-tools/generate_keys.py
 cmake --preset Debug && cmake --build build/Debug --target all -j 10
 openocd -f interface/stlink.cfg -f target/stm32h7x.cfg \
