@@ -9,8 +9,20 @@ on:
       - "*.*.*-rc.*"
       - "*.*.*-dev.*"
 
+# id-token: write lets the job obtain a GitHub OIDC token, which Google Cloud
+# exchanges (Workload Identity Federation) for a short-lived identity. No Google
+# credential is stored in this repository. The federation binding only accepts
+# tag refs of this repository, so branch builds cannot upload.
 permissions:
   contents: write
+  id-token: write
+
+env:
+  # Private artifact store for bootloader binaries (plan D7: the binary is no
+  # longer a public release asset). Layout: gs://<bucket>/<repo>/<tag>/...
+  GCS_BUCKET: openwater-firmware-artifacts
+  WIF_PROVIDER: projects/341318872140/locations/global/workloadIdentityPools/github/providers/github-oidc
+  UPLOADER_SA: sa-bl-artifact-uploader@openwater-cloud.iam.gserviceaccount.com
 
 jobs:
   build:
@@ -50,9 +62,11 @@ jobs:
 
       # Regenerate the SECoreBin key file from key material kept OUT of git:
       #   - AES-128 key  : from the SECOREBIN_AES_KEY secret (base64 of the 16 raw bytes)
-      #   - ECC pub key  : derived from the committed py-tools/keys/ecdsa_public.pem
-      # se_key.s embeds the AES secret, so it is .gitignored and produced here at
-      # build time. The ECDSA *private* signing key is NOT needed to build the BL.
+      #   - ECC pub key  : the committed py-tools/keys/ecdsa_public.pem, which is the
+      #                    public half of the Google Cloud KMS signing key for this
+      #                    product (see py-tools/export_public_key.py). The private
+      #                    key exists only inside the KMS HSM and is never needed here.
+      # se_key.s embeds the AES value, so it is .gitignored and produced at build time.
       - name: Regenerate se_key.s from key material
         env:
           SECOREBIN_AES_KEY: ${{ secrets.SECOREBIN_AES_KEY }}
@@ -85,6 +99,15 @@ jobs:
           rm -f "$RUNNER_TEMP/aes128.bin"
           test -s SECoreBin/Startup/se_key.s && echo "se_key.s regenerated."
 
+      # Fingerprint of the public key this bootloader will trust. Goes into the
+      # release notes so a unit's trusted key can be traced to a KMS key version.
+      - name: Fingerprint trusted public key
+        id: pubkey
+        run: |
+          FP=$(openssl pkey -pubin -in py-tools/keys/ecdsa_public.pem -outform DER | openssl dgst -sha256 | awk '{print $2}')
+          echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
+          echo "Trusted signing key: sha256:$FP"
+
       - name: Pull build image
         run: docker pull ghcr.io/openwaterhealth/stm32-build-env:latest
 
@@ -114,7 +137,20 @@ jobs:
           done
           [ "$missing" -eq 0 ]
 
-      - name: Upload firmware artifact
+      - name: Checksums
+        id: sums
+        run: |
+          cd "build/${{ steps.cfg.outputs.config }}"
+          sha256sum openmotion-bl.bin openmotion-bl.hex openmotion-bl.elf > SHA256SUMS
+          cat SHA256SUMS
+          echo "bin_sha256=$(awk '/openmotion-bl.bin$/{print $1}' SHA256SUMS)" >> "$GITHUB_OUTPUT"
+
+      # Debug builds (branch pushes, dispatch, *-dev.* tags) stay available as a
+      # workflow artifact for developers. Release builds (rc / final tags) are
+      # distributed only through the private bucket below; on a public repository
+      # a workflow artifact is downloadable by anyone with a GitHub account.
+      - name: Upload workflow artifact (Debug builds only)
+        if: steps.cfg.outputs.config == 'Debug'
         uses: actions/upload-artifact@v4
         with:
           name: openmotion-bl-${{ steps.cfg.outputs.config }}
@@ -122,6 +158,33 @@ jobs:
             build/${{ steps.cfg.outputs.config }}/*.hex
             build/${{ steps.cfg.outputs.config }}/*.bin
             build/${{ steps.cfg.outputs.config }}/*.elf
+            build/${{ steps.cfg.outputs.config }}/SHA256SUMS
+
+      # ---------------------------
+      # Tag builds: publish the binaries to the private artifact bucket.
+      # Identity: GitHub OIDC -> Workload Identity Federation -> sa-bl-artifact-uploader,
+      # which holds roles/storage.objectCreator only (write-once: cannot read,
+      # delete or overwrite). Bucket retention prevents replacement by anyone else.
+      # ---------------------------
+      - name: Authenticate to Google Cloud (uploader)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.UPLOADER_SA }}
+
+      - name: Set up gcloud
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload binaries to the private artifact bucket
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          DEST="gs://${GCS_BUCKET}/${{ github.event.repository.name }}/${GITHUB_REF_NAME}/"
+          cd "build/${{ steps.cfg.outputs.config }}"
+          gcloud storage cp openmotion-bl.bin openmotion-bl.hex openmotion-bl.elf SHA256SUMS "$DEST"
+          echo "Uploaded to $DEST"
 
       - name: Detect release type
         id: reltype
@@ -168,7 +231,12 @@ jobs:
           echo "**Build SHA:** \`${{ steps.buildmeta.outputs.sha }}\`" >> notes.md
           echo "**Build Time:** ${{ steps.buildmeta.outputs.datetime }}" >> notes.md
           echo "**Build Config:** ${{ steps.cfg.outputs.config }}" >> notes.md
+          echo "**Trusted signing key (SHA-256 of public key):** \`${{ steps.pubkey.outputs.fingerprint }}\`" >> notes.md
+          echo "**openmotion-bl.bin SHA-256:** \`${{ steps.sums.outputs.bin_sha256 }}\`" >> notes.md
+          echo "**Binaries:** \`gs://${GCS_BUCKET}/${{ github.event.repository.name }}/${GITHUB_REF_NAME}/\` (private; access via Openwater Google Cloud)" >> notes.md
 
+      # The release carries notes and the SBOM only. Binaries are in the private
+      # bucket (plan D7); the firmware CI fetches them with its own federated identity.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -180,5 +248,4 @@ jobs:
           overwrite_files: true
           make_latest: ${{ steps.reltype.outputs.prerelease == 'false' }}
           files: |
-            build/${{ steps.cfg.outputs.config }}/*.hex
-            build/${{ steps.cfg.outputs.config }}/*.bin
+            sbom.cdx.json

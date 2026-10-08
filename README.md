@@ -70,11 +70,18 @@ USB mux at its FS default:
 The bootloader embeds the **sensor** signing public key. Applications must be
 signed with the matching sensor private key or they are rejected at boot.
 
-- Public key: `py-tools/keys/ecdsa_public.pem` (committed).
-  Fingerprint (SHA‑256, first 16 hex): `275e94117a64a528`.
-- The ECDSA **private** key and the AES key are kept **out of git** (stored as
-  CI secrets / offline). `se_key.s` — which embeds the AES key and public key —
-  is generated at build time and is `.gitignore`d.
+- Public key: `py-tools/keys/ecdsa_public.pem` (committed). It is the public half
+  of the Google Cloud KMS key `projects/openwater-cloud/locations/us-central1/keyRings/openmotion-firmware/cryptoKeys/sensor-fw-signing` (version 1).
+  Fingerprint (SHA-256 of the DER SubjectPublicKeyInfo): `55f6ef94ef9c76ad62f798a44b7d945096a83f0a7910600d57a1e8f3b88a8c7b`.
+  Confirm with `python py-tools/export_public_key.py --kms-key projects/openwater-cloud/locations/us-central1/keyRings/openmotion-firmware/cryptoKeys/sensor-fw-signing/cryptoKeyVersions/1 --check`.
+- The ECDSA **private** key exists only inside the KMS HSM (non-exportable). It is
+  never downloaded, never stored in CI, and not needed to build this bootloader.
+  Firmware CI signs through Workload Identity Federation; see the Open-Motion
+  workspace `RUNBOOK-kms-signing-setup.md`.
+- The AES-128 key is kept out of git (CI secret `SECOREBIN_AES_KEY`). The crypto
+  scheme embeds it in SECoreBin, but slot images are stored in clear and
+  authenticated by signature, so it protects nothing. `se_key.s`, which embeds
+  the AES key and the public key, is generated at build time and is `.gitignore`d.
 
 The sensor key set is independent of the console key set; do not cross them.
 
@@ -100,9 +107,16 @@ Outputs: `build/Release/openmotion-bl.{elf,hex,bin}`.
 
 `.github/workflows/build-firmware.yml` regenerates `se_key.s` from the
 `SECOREBIN_AES_KEY` repository secret (base64 of the 16 raw AES bytes) plus the
-committed public key, then builds and publishes a release. **`SECOREBIN_AES_KEY`
-must hold the sensor AES key** — a mismatched secret silently produces a
-bootloader that rejects sensor-signed firmware:
+committed public key, builds, and on a tag:
+
+- uploads `openmotion-bl.{bin,hex,elf}` and `SHA256SUMS` to the private bucket
+  `gs://openwater-firmware-artifacts/<repo>/<tag>/` through Workload Identity
+  Federation (no stored Google credential; accepted for tag refs only);
+- creates a GitHub Release carrying the notes (build SHA, trusted-key fingerprint,
+  binary SHA-256, bucket path) and the SBOM. **Binaries are not release assets.**
+
+Release-config builds exist only in the bucket. Debug builds (branches, `*-dev.*`
+tags) are also kept as workflow artifacts for developers. The AES secret:
 
 ```sh
 base64 -w0 <sensor aes128.bin>   # -> set as the SECOREBIN_AES_KEY secret
@@ -110,23 +124,36 @@ base64 -w0 <sensor aes128.bin>   # -> set as the SECOREBIN_AES_KEY secret
 
 ## Signing an application
 
-Sign the raw application `.bin` with the sensor keys before installing:
+Production images are signed in CI with the sensor key in Google Cloud KMS; no
+private key is available locally. For bench work against a Debug bootloader
+built from a local **test** key pair (`py-tools/generate_keys.py`):
 
 ```sh
 python py-tools/sign_firmware.py \
     --firmware    motion-sensor-fw.bin \
-    --private-key <sensor ecdsa_private.pem> \
-    --aes-key     <sensor aes128.bin> \
-    --version     <N> \
+    --private-key py-tools/keys/ecdsa_private.pem \
+    --version     <MAJOR.MINOR.PATCH> \
     --output      motion-sensor-fw_signed.bin
+python py-tools/verify_firmware.py motion-sensor-fw_signed.bin
+```
+
+With KMS signing rights (`roles/cloudkms.signerVerifier`; normally CI only):
+
+```sh
+python py-tools/sign_firmware.py --firmware motion-sensor-fw.bin \
+    --kms-key projects/openwater-cloud/locations/us-central1/keyRings/openmotion-firmware/cryptoKeys/sensor-fw-signing/cryptoKeyVersions/1 \
+    --version <MAJOR.MINOR.PATCH> --output motion-sensor-fw_signed.bin
 ```
 
 The application must be linked to run at **`0x08020400`** (FLASH origin at the
 slot + 0x400 header offset, with VTOR relocated there).
 
-`--version` becomes the 16-bit `FwVersion` used by the monotonic anti-rollback
-floor: a unit that has booted version *N* refuses any image `< N` until
-re-flashed, so keep release versions increasing.
+`--version` is a dotted semver encoded as `major*10000 + minor*100 + patch` into
+the signed header's 16-bit `FwVersion` (minor and patch 0–99, maximum 6.55.35,
+`0.0.0` invalid). The monotonic anti-rollback floor compares this value: a unit
+that has booted version *N* refuses any image `< N` until re-flashed, so keep
+release versions increasing. See `py-tools/README.md` §"Firmware versioning &
+anti-rollback" for the full encoding table.
 
 ## Flashing
 

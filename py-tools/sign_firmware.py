@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-sign_firmware.py  —  Create an SBSFU-compatible signed+encrypted firmware image.
+sign_firmware.py  —  Create an SBSFU-compatible signed firmware image.
 
-Crypto scheme: SECBOOT_ECCDSA_WITH_AES128_CBC_SHA256
-  • Firmware is encrypted with AES-128-CBC.
+Crypto scheme: SECBOOT_ECCDSA_WITH_AES128_CBC_SHA256 (header format)
   • A 320-byte header is prepended containing metadata, the SHA-256 of the
-    PLAINTEXT firmware (FwTag), the AES IV, and an ECDSA-P256/SHA-256 signature
+    firmware (FwTag), an AES-CBC IV field, and an ECDSA-P256/SHA-256 signature
     over the first 128 authenticated bytes of the header.
+  • The firmware body is written IN CLEAR (see Step 3 below): the bootloader
+    authenticates the active slot by SHA-256 only. No AES key is needed to sign.
+
+Signing backends
+  • --kms-key      Google Cloud KMS asymmetric key version (HSM, non-exportable).
+                   Production path. Credentials come from Application Default
+                   Credentials (in CI: google-github-actions/auth via Workload
+                   Identity Federation). The signature is verified locally against
+                   the KMS public key before the image is written.
+  • --private-key  Local ECDSA P-256 PEM. Debug builds and bench test keys only.
 
 Output image layout (written to SLOT_ACTIVE_1 starting at 0x08020000 via DFU):
 
@@ -27,17 +36,24 @@ Output image layout (written to SLOT_ACTIVE_1 starting at 0x08020000 via DFU):
     ─── end of header (320 bytes = 0x140) ───────────────────────────────────
     Offset 0x140  [FwSize] Encrypted firmware (AES-128-CBC)
 
-The resulting binary is intended for upload via USB DFU to address 0x08020000:
+The resulting binary is installed into the active slot over USB DFU:
 
-    dfu-util -D <output>.bin -a 0 -s 0x08020000:leave
+    python py-tools/flash_firmware.py <output>.bin
 
 Usage
 -----
+    # Production (CI): sign with the HSM-held key in Google Cloud KMS
     python sign_firmware.py \\
-        --firmware   path/to/app.bin          \\
+        --firmware   path/to/app.bin \\
+        --kms-key    projects/<project>/locations/<loc>/keyRings/<ring>/cryptoKeys/<key>/cryptoKeyVersions/<n> \\
+        --version    1.0.0 \\
+        --output     signed_app.bin
+
+    # Debug / bench: sign with a local test key
+    python sign_firmware.py \\
+        --firmware     path/to/app.bin \\
         --private-key  py-tools/keys/ecdsa_private.pem \\
-        --aes-key      py-tools/keys/aes128.bin        \\
-        --version      1.0.0                           \\
+        --version      1.0.0 \\
         --output       signed_app.bin
 """
 
@@ -191,14 +207,98 @@ def _aes128_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
     return enc.update(plaintext) + enc.finalize()
 
 
-def _ecdsa_sign_raw(private_key, data: bytes) -> bytes:
-    """
-    Sign data with ECDSA-P256/SHA-256.
-    Returns the 64-byte raw signature: R (32 bytes big-endian) || S (32 bytes big-endian).
-    """
-    der_sig = private_key.sign(data, ec.ECDSA(hashes.SHA256()))
+def _der_to_raw_rs(der_sig: bytes) -> bytes:
+    """DER ECDSA signature -> 64-byte raw R (32 B big-endian) || S (32 B big-endian)."""
     r, s = decode_dss_signature(der_sig)
     return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
+class LocalPemSigner:
+    """ECDSA-P256/SHA-256 with a local private key PEM (Debug builds, bench test keys)."""
+
+    name = "local PEM"
+
+    def __init__(self, private_key_pem: bytes):
+        self._priv = serialization.load_pem_private_key(private_key_pem, password=None)
+        if not isinstance(self._priv, ec.EllipticCurvePrivateKey) or \
+                not isinstance(self._priv.curve, ec.SECP256R1):
+            raise ValueError("--private-key must be an ECDSA P-256 (secp256r1) private key")
+
+    def public_key_pem(self) -> bytes:
+        return self._priv.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+    def sign_raw(self, data: bytes) -> bytes:
+        return _der_to_raw_rs(self._priv.sign(data, ec.ECDSA(hashes.SHA256())))
+
+
+class KmsSigner:
+    """
+    ECDSA-P256/SHA-256 with a Google Cloud KMS asymmetric key version.
+
+    `key_version` is the full resource name
+      projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>/cryptoKeyVersions/<n>
+    The private key never leaves the HSM; KMS signs the SHA-256 digest we send.
+    Authentication is Application Default Credentials (gcloud auth
+    application-default login, or Workload Identity Federation in CI).
+    """
+
+    name = "Google Cloud KMS"
+
+    def __init__(self, key_version: str):
+        try:
+            from google.cloud import kms  # type: ignore
+        except ImportError:
+            sys.exit(
+                "ERROR: 'google-cloud-kms' package not found (needed for --kms-key).\n"
+                "Run:  pip install -r py-tools/requirements.txt"
+            )
+        if "/cryptoKeyVersions/" not in key_version:
+            raise ValueError(
+                "--kms-key must name a crypto key VERSION "
+                "(.../cryptoKeys/<key>/cryptoKeyVersions/<n>), got: " + key_version)
+        self._client = kms.KeyManagementServiceClient()
+        self._key_version = key_version
+        meta = self._client.get_crypto_key_version(request={"name": key_version})
+        algo = kms.CryptoKeyVersion.CryptoKeyVersionAlgorithm
+        if meta.algorithm != algo.EC_SIGN_P256_SHA256:
+            raise ValueError(f"KMS key version algorithm is {meta.algorithm.name}, "
+                             "expected EC_SIGN_P256_SHA256")
+        if meta.state != kms.CryptoKeyVersion.CryptoKeyVersionState.ENABLED:
+            raise ValueError(f"KMS key version is {meta.state.name}, not ENABLED")
+        self.protection_level = meta.protection_level.name
+        self._pub_pem = self._client.get_public_key(request={"name": key_version}).pem.encode()
+
+    def public_key_pem(self) -> bytes:
+        return self._pub_pem
+
+    def sign_raw(self, data: bytes) -> bytes:
+        digest = hashlib.sha256(data).digest()
+        resp = self._client.asymmetric_sign(
+            request={"name": self._key_version, "digest": {"sha256": digest}})
+        return _der_to_raw_rs(resp.signature)
+
+
+def _verify_raw_rs(public_key_pem: bytes, data: bytes, raw_sig: bytes) -> None:
+    """Raise if raw R||S is not a valid ECDSA-P256/SHA-256 signature of data."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+    pub = serialization.load_pem_public_key(public_key_pem)
+    der = encode_dss_signature(int.from_bytes(raw_sig[:32], "big"),
+                               int.from_bytes(raw_sig[32:], "big"))
+    try:
+        pub.verify(der, data, ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        raise RuntimeError("signature does not verify against the signer's public key")
+
+
+def public_key_fingerprint(public_key_pem: bytes) -> str:
+    """SHA-256 over the DER SubjectPublicKeyInfo, hex. Matches
+    `openssl pkey -pubin -outform DER | openssl dgst -sha256`."""
+    pub = serialization.load_pem_public_key(public_key_pem)
+    der = pub.public_bytes(serialization.Encoding.DER,
+                           serialization.PublicFormat.SubjectPublicKeyInfo)
+    return hashlib.sha256(der).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -207,35 +307,42 @@ def _ecdsa_sign_raw(private_key, data: bytes) -> bytes:
 
 def sign_firmware(
     firmware_bin: bytes,
-    private_key_pem: bytes,
-    aes_key: bytes,
+    private_key_pem: bytes | None = None,
+    aes_key: bytes | None = None,
     fw_version: int = 1,
+    signer=None,
 ) -> bytes:
     """
-    Sign and encrypt a raw firmware binary for SBSFU.
+    Sign a raw firmware binary for SBSFU.
 
     Parameters
     ----------
     firmware_bin    : raw application .bin (starts at application load address)
-    private_key_pem : PEM-encoded ECDSA P-256 private key
-    aes_key         : 16-byte AES-128 key
+    private_key_pem : PEM-encoded ECDSA P-256 private key (local signing);
+                      ignored when `signer` is given
+    aes_key         : optional 16-byte AES-128 key. Accepted for compatibility
+                      and validated if given; NOT used (body is stored in clear).
     fw_version      : 16-bit packed FwVersion (see pack_semver);
                       must be in [1, 0xFFFF] — 0 (0.0.0) is invalid.
+    signer          : object with sign_raw(data)->64 B and public_key_pem()->PEM
+                      (LocalPemSigner or KmsSigner). Takes precedence.
 
     Returns
     -------
-    bytes — complete signed image: SBSFU header (320 B) + encrypted firmware
+    bytes — complete signed image: SBSFU header (320 B) + padding + firmware
     """
 
-    if len(aes_key) != 16:
+    if aes_key is not None and len(aes_key) != 16:
         raise ValueError(f"AES key must be 16 bytes, got {len(aes_key)}")
     if not (1 <= fw_version <= 0xFFFF):
         raise ValueError(
             f"fw_version must be in 1..65535 (0 is invalid); got {fw_version}"
         )
 
-    # Load private key
-    priv = serialization.load_pem_private_key(private_key_pem, password=None)
+    if signer is None:
+        if private_key_pem is None:
+            raise ValueError("either `signer` or `private_key_pem` is required")
+        signer = LocalPemSigner(private_key_pem)
 
     # ------------------------------------------------------------------
     # Step 1: Pad plaintext to a multiple of FLASH_WORD (32 bytes).
@@ -298,8 +405,12 @@ def sign_firmware(
     # ------------------------------------------------------------------
     # Step 5: ECDSA-P256/SHA-256 sign the 128-byte authenticated header
     # ------------------------------------------------------------------
-    signature = _ecdsa_sign_raw(priv, auth_header)   # 64 bytes R||S
+    signature = signer.sign_raw(auth_header)   # 64 bytes R||S
     assert len(signature) == HEADER_SIGN_LEN
+    # Independent check: the signature must verify with the signer's own public
+    # key. Catches a misconfigured KMS key or a corrupt response before anything
+    # is written.
+    _verify_raw_rs(signer.public_key_pem(), auth_header, signature)
 
     # ------------------------------------------------------------------
     # Step 6: Assemble the full 320-byte header
@@ -330,19 +441,27 @@ def sign_firmware(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Sign and encrypt a firmware binary for SBSFU "
-                    "(ECCDSA_WITH_AES128_CBC_SHA256)."
+        description="Sign a firmware binary for the SBSFU active slot "
+                    "(ECCDSA_WITH_AES128_CBC_SHA256 header format, clear body)."
     )
     parser.add_argument("--firmware",    required=True, help="Input raw .bin file.")
-    parser.add_argument(
+    key_grp = parser.add_mutually_exclusive_group()
+    key_grp.add_argument(
+        "--kms-key",
+        help="Google Cloud KMS crypto key VERSION resource name "
+             "(projects/.../cryptoKeys/<key>/cryptoKeyVersions/<n>). Production signing; "
+             "uses Application Default Credentials.",
+    )
+    key_grp.add_argument(
         "--private-key",
-        default=str(Path(__file__).parent / "keys" / "ecdsa_private.pem"),
-        help="ECDSA P-256 private key PEM (default: py-tools/keys/ecdsa_private.pem).",
+        help="Local ECDSA P-256 private key PEM. Debug/bench test keys only "
+             "(default when --kms-key is absent: py-tools/keys/ecdsa_private.pem).",
     )
     parser.add_argument(
         "--aes-key",
-        default=str(Path(__file__).parent / "keys" / "aes128.bin"),
-        help="Raw 16-byte AES-128 key binary (default: py-tools/keys/aes128.bin).",
+        default=None,
+        help="Raw 16-byte AES-128 key. Optional and unused for signing (the slot image "
+             "body is stored in clear); accepted for backward compatibility.",
     )
     parser.add_argument(
         "--version", type=str, default="0.0.1",
@@ -359,9 +478,19 @@ def main() -> None:
     fw_path  = Path(args.firmware)
     out_path = Path(args.output) if args.output else fw_path.with_stem(fw_path.stem + "_signed")
 
-    firmware_bin    = fw_path.read_bytes()
-    private_key_pem = Path(args.private_key).read_bytes()
-    aes_key         = Path(args.aes_key).read_bytes()
+    firmware_bin = fw_path.read_bytes()
+    aes_key = Path(args.aes_key).read_bytes() if args.aes_key else None
+
+    if args.kms_key:
+        signer = KmsSigner(args.kms_key)
+        key_desc = f"{args.kms_key} ({signer.protection_level})"
+    else:
+        pem_path = Path(args.private_key) if args.private_key \
+            else Path(__file__).parent / "keys" / "ecdsa_private.pem"
+        if not pem_path.is_file():
+            parser.error(f"private key not found: {pem_path} (use --kms-key for production signing)")
+        signer = LocalPemSigner(pem_path.read_bytes())
+        key_desc = str(pem_path)
 
     try:
         fw_version = parse_version_arg(args.version)
@@ -372,12 +501,14 @@ def main() -> None:
     print(f"[sign_firmware] Input        : {fw_path}  ({len(firmware_bin):,} bytes)")
     print(f"[sign_firmware] FW version   : {major}.{minor}.{patch}  "
           f"(FwVersion = {fw_version} / 0x{fw_version:04X})")
+    print(f"[sign_firmware] Signer       : {signer.name}  {key_desc}")
+    print(f"[sign_firmware] Public key   : sha256:{public_key_fingerprint(signer.public_key_pem())}")
 
     signed = sign_firmware(
-        firmware_bin    = firmware_bin,
-        private_key_pem = private_key_pem,
-        aes_key         = aes_key,
-        fw_version      = fw_version,
+        firmware_bin = firmware_bin,
+        aes_key      = aes_key,
+        fw_version   = fw_version,
+        signer       = signer,
     )
 
     out_path.write_bytes(signed)
@@ -388,12 +519,13 @@ def main() -> None:
           f"sig={HEADER_SIGN_LEN}, state={HEADER_STATE_LEN}, fp={HEADER_FP_LEN})")
     print(f"[sign_firmware] FW @ offset  : 0x{IMAGE_OFFSET:X} (SFU_IMG_IMAGE_OFFSET; "
           f"0x{IMAGE_OFFSET - HEADER_TOTAL_LEN:X} bytes of 0xFF padding after header)")
-    print(f"[sign_firmware] Encrypted FW : {fw_size:,} bytes")
+    print(f"[sign_firmware] FW body      : {fw_size:,} bytes (clear, SHA-256 in header)")
     print(f"[sign_firmware] Total output : {len(signed):,} bytes")
     print(f"[sign_firmware] Output       : {out_path}")
     print()
-    print("Upload to device:")
-    print(f"  dfu-util -D \"{out_path}\" -a 0 -s 0x08020000:leave")
+    print("Check, then install over USB DFU:")
+    print(f"  python py-tools/verify_firmware.py \"{out_path}\"")
+    print(f"  python py-tools/flash_firmware.py  \"{out_path}\"")
 
 
 if __name__ == "__main__":
