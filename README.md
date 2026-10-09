@@ -189,4 +189,8 @@ recorded under tracker T2, not a build option.
 > user-config sector) of a bench unit before flashing it, and power-cycle with
 > the probe disconnected afterwards — at RDP level 1 the core cannot execute
 > from flash while a debugger is attached. The protected build has been
-> bench-tested on the console only; the sensor needs its own pass.
+> bench-tested on the console and on a sensor module (2026-10-08).
+
+## License
+
+Openwater-authored bootloader code in this repository is offered under Apache-2.0; see [LICENSE](LICENSE). The repository also contains STMicroelectronics and other third-party components that remain under their own terms. In particular, the SBSFU and Secure Engine code is identified under ST SLA0044/SLA0048 in the build-time SBOM (`scripts/gen_sbom.py`, attached to every release); component license files are retained under their respective directories. The Apache license does not replace those third-party terms. Review the component licenses before redistributing a complete bootloader image.
