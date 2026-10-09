@@ -11,6 +11,10 @@ equivalent of:
 The input MUST be a signed image (header + clear firmware at offset 0x400), not a
 raw application .bin. See sign_firmware.py / README.md.
 
+Before anything is erased the image is checked on the host (signature, FwTag,
+size, downgrade) with verify_firmware.py, so a bad file is refused while the
+installed firmware is still intact.
+
 Usage:
     python flash_firmware.py app_signed.bin           # install signed image to slot
     python flash_firmware.py flash app_signed.bin --verify
@@ -27,6 +31,13 @@ import time
 # Allow running from any directory
 sys.path.insert(0, os.path.dirname(__file__))
 from stm32dfu import STM32DFU, DFUError
+from verify_firmware import (
+    DEFAULT_PUBLIC_KEY,
+    ImageVerificationError,
+    read_header_version,
+    verify_image,
+)
+import migrate
 
 
 # ── defaults ─────────────────────────────────────────────────────────────────
@@ -86,15 +97,29 @@ def cmd_flash(args):
     with open(bin_path, "rb") as f:
         firmware = f.read()
 
-    # Sanity-check that this looks like a signed SBSFU image, not a raw app .bin.
-    if firmware[:4] != b"SFU1":
-        print("Warning: image does not start with the 'SFU1' magic — this does not look\n"
-              "         like a signed image. The bootloader will reject a raw .bin.\n"
-              "         Sign it first with sign_firmware.py.")
+    # Pre-flight: run the bootloader's checks on the file while the installed
+    # image is still intact. The download erases the slot first and SBSFU only
+    # verifies on the next boot, so a bad image caught there has already cost the
+    # device its working firmware (it stays in DFU until a good one is flashed).
+    info = None
+    if args.allow_unverified:
+        print("WARNING: pre-flight verification skipped (--allow-unverified).\n"
+              "         If the bootloader rejects this image the device will stay\n"
+              "         in DFU mode with no application installed.")
+    else:
+        with open(args.public_key, "rb") as f:
+            public_key_pem = f.read()
+        try:
+            info = verify_image(firmware, public_key_pem)
+        except ImageVerificationError as e:
+            print(f"Error: image rejected, nothing was flashed: {e}")
+            sys.exit(1)
 
     size_kb = len(firmware) / 1024
     print(f"Firmware : {bin_path}")
     print(f"Size     : {size_kb:.1f} KB  ({len(firmware)} bytes)")
+    if info is not None:
+        print(f"FwVersion: {info.version_str}  (signature and FwTag verified)")
     print(f"Target   : {address:#010x}  (SBSFU active slot)")
     print()
 
@@ -103,6 +128,16 @@ def cmd_flash(args):
         _, _, state, _ = dfu.get_status()
         print(f"Connected. DFU state: {state}")
         print()
+
+        # Downgrade pre-flight: the bootloader destroys a downloaded image that
+        # is older than the one it replaced, so refuse before the erase instead.
+        if info is not None:
+            installed = read_header_version(dfu.upload(address, 8))
+            if info.fw_version < installed:
+                print(f"Error: image FwVersion {info.fw_version} is older than the installed "
+                      f"{installed}; the bootloader\n"
+                      "       refuses downgrades. Nothing was flashed.")
+                sys.exit(1)
 
         print("Programming...")
         t0 = time.monotonic()
@@ -195,6 +230,14 @@ def main():
     p_flash.add_argument(
         "--verify", action="store_true",
         help="Read back and verify after download")
+    p_flash.add_argument(
+        "--public-key", default=str(DEFAULT_PUBLIC_KEY),
+        help="ECDSA public key PEM the bootloader was built with, for the "
+             "pre-flight image check (default: py-tools/keys/ecdsa_public.pem)")
+    p_flash.add_argument(
+        "--allow-unverified", action="store_true",
+        help="Skip the pre-flight image check. Bench use only (negative-path "
+             "tests); the bootloader still verifies the image at boot")
 
     # read
     p_read = sub.add_parser("read", help="Read and hex-dump device memory")
@@ -215,9 +258,12 @@ def main():
     sub.add_parser("version", aliases=["dfu_ver"],
                    help="Read the bootloader version (FW_VERSION) over DFU")
 
+    # enter-dfu / migrate (console fleet migration to bootloader 1.2.0; see migrate.py)
+    migrate.add_subcommands(sub)
+
     # Make 'flash' the default sub-command so a bare image path works:
     #   python flash_firmware.py app_signed.bin
-    known = {"list", "flash", "read", "erase", "leave", "version", "dfu_ver"}
+    known = {"list", "flash", "read", "erase", "leave", "version", "dfu_ver", "enter-dfu", "migrate"}
     argv = list(sys.argv[1:])
     i = 0
     first_pos = None
@@ -246,7 +292,10 @@ def main():
         "version": cmd_version,
         "dfu_ver": cmd_version,
     }
-    dispatch[args.command](args)
+    if getattr(args, "func", None):
+        args.func(args)
+    else:
+        dispatch[args.command](args)
 
 
 if __name__ == "__main__":

@@ -9,8 +9,24 @@ on:
       - "*.*.*-rc.*"
       - "*.*.*-dev.*"
 
+# id-token: write lets the job obtain a GitHub OIDC token, which Google Cloud
+# exchanges (Workload Identity Federation) for a short-lived identity. No Google
+# credential is stored in this repository. The federation binding only accepts
+# tag refs of this repository, so branch builds cannot upload.
 permissions:
   contents: write
+  id-token: write
+
+env:
+  # Private artifact store for bootloader binaries (plan D7: the binary is no
+  # longer a public release asset). Layout: gs://<bucket>/<repo>/<tag>/<repo>-<tag>.{bin,hex,elf} + SHA256SUMS
+  GCS_BUCKET: openwater-firmware-artifacts
+  WIF_PROVIDER: projects/341318872140/locations/global/workloadIdentityPools/github/providers/github-oidc
+  UPLOADER_SA: sa-bl-artifact-uploader@openwater-cloud.iam.gserviceaccount.com
+  # Read-only identity (roles/cloudkms.publicKeyViewer on the key ring, nothing else)
+  # used on every build to confirm that the committed public key IS the KMS key.
+  PUBKEY_READER_SA: sa-bl-pubkey-reader@openwater-cloud.iam.gserviceaccount.com
+  KMS_KEY_VERSION: projects/openwater-cloud/locations/us-central1/keyRings/openmotion-firmware/cryptoKeys/sensor-fw-signing/cryptoKeyVersions/1
 
 jobs:
   build:
@@ -50,9 +66,11 @@ jobs:
 
       # Regenerate the SECoreBin key file from key material kept OUT of git:
       #   - AES-128 key  : from the SECOREBIN_AES_KEY secret (base64 of the 16 raw bytes)
-      #   - ECC pub key  : derived from the committed py-tools/keys/ecdsa_public.pem
-      # se_key.s embeds the AES secret, so it is .gitignored and produced here at
-      # build time. The ECDSA *private* signing key is NOT needed to build the BL.
+      #   - ECC pub key  : the committed py-tools/keys/ecdsa_public.pem, which is the
+      #                    public half of the Google Cloud KMS signing key for this
+      #                    product (see py-tools/export_public_key.py). The private
+      #                    key exists only inside the KMS HSM and is never needed here.
+      # se_key.s embeds the AES value, so it is .gitignored and produced at build time.
       - name: Regenerate se_key.s from key material
         env:
           SECOREBIN_AES_KEY: ${{ secrets.SECOREBIN_AES_KEY }}
@@ -85,6 +103,33 @@ jobs:
           rm -f "$RUNNER_TEMP/aes128.bin"
           test -s SECoreBin/Startup/se_key.s && echo "se_key.s regenerated."
 
+      # Fingerprint of the public key this bootloader will trust. Goes into the
+      # release notes so a unit's trusted key can be traced to a KMS key version.
+      - name: Fingerprint trusted public key
+        id: pubkey
+        run: |
+          FP=$(openssl pkey -pubin -in py-tools/keys/ecdsa_public.pem -outform DER | openssl dgst -sha256 | awk '{print $2}')
+          echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
+          echo "Trusted signing key: sha256:$FP"
+
+      # ---------------------------
+      # Integrity check of the committed public key: fetch the public half of the
+      # production signing key from Cloud KMS and fail the build if it is not the
+      # PEM we just compiled in. Read-only federated identity; no stored credential.
+      # Guards against a wrong or tampered PEM shipping in a bootloader.
+      # ---------------------------
+      - name: Authenticate to Google Cloud (public-key reader)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.PUBKEY_READER_SA }}
+
+      - name: Verify committed public key against Cloud KMS
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check -r py-tools/requirements.txt
+          python3 py-tools/export_public_key.py --kms-key "$KMS_KEY_VERSION" \
+            --output py-tools/keys/ecdsa_public.pem --check
+
       - name: Pull build image
         run: docker pull ghcr.io/openwaterhealth/stm32-build-env:latest
 
@@ -114,14 +159,77 @@ jobs:
           done
           [ "$missing" -eq 0 ]
 
-      - name: Upload firmware artifact
+      # The container writes build/ as root, so collect the outputs into a directory the
+      # runner owns before adding checksums. Files are named <repository>-<ref>.<ext>
+      # (e.g. open-motion-console-bl-1.2.0-rc.0.bin) so a stored binary is unambiguous
+      # on its own, and nothing in the bucket is ever overwritten or shadowed.
+      - name: Collect outputs and checksums
+        id: sums
+        run: |
+          set -euo pipefail
+          NAME="${{ github.event.repository.name }}-$(echo "$GITHUB_REF_NAME" | tr '/' '-')"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p _out
+          for ext in bin hex elf; do
+            cp "build/${{ steps.cfg.outputs.config }}/openmotion-bl.$ext" "_out/$NAME.$ext"
+          done
+          # Build-time SBOM (CycloneDX 1.6): HAL/CMSIS versions from the tree, reviewed
+          # static components from scripts/sbom-manifest.json, toolchain and build image as
+          # built, and the public key this bootloader trusts.
+          TOOLCHAIN="$(docker run --rm ghcr.io/openwaterhealth/stm32-build-env:latest arm-none-eabi-gcc --version | head -1)"
+          IMAGE="$(docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/openwaterhealth/stm32-build-env:latest 2>/dev/null || echo ghcr.io/openwaterhealth/stm32-build-env:latest)"
+          python3 scripts/gen_sbom.py --root . --manifest scripts/sbom-manifest.json \
+            --name "${{ github.event.repository.name }}" --version "$GITHUB_REF_NAME" \
+            --config "${{ steps.cfg.outputs.config }}" --toolchain "$TOOLCHAIN" --build-image "$IMAGE" \
+            --property "openwater:trusted-public-key-sha256=${{ steps.pubkey.outputs.fingerprint }}" \
+            --property "openwater:kms-key-version=$KMS_KEY_VERSION" \
+            -o "_out/$NAME.cdx.json"
+          cd _out
+          sha256sum "$NAME.bin" "$NAME.hex" "$NAME.elf" "$NAME.cdx.json" > SHA256SUMS
+          cat SHA256SUMS
+          echo "bin_sha256=$(awk -v f="$NAME.bin" '$2==f{print $1}' SHA256SUMS)" >> "$GITHUB_OUTPUT"
+
+      # Debug builds (branch pushes, dispatch, *-dev.* tags) stay available as a
+      # workflow artifact for developers. Release builds (rc / final tags) are
+      # distributed only through the private bucket below; on a public repository
+      # a workflow artifact is downloadable by anyone with a GitHub account.
+      - name: Upload workflow artifact (Debug builds only)
+        if: steps.cfg.outputs.config == 'Debug'
         uses: actions/upload-artifact@v4
         with:
-          name: openmotion-bl-${{ steps.cfg.outputs.config }}
-          path: |
-            build/${{ steps.cfg.outputs.config }}/*.hex
-            build/${{ steps.cfg.outputs.config }}/*.bin
-            build/${{ steps.cfg.outputs.config }}/*.elf
+          name: ${{ steps.sums.outputs.name }}-${{ steps.cfg.outputs.config }}
+          path: _out/*
+
+      # ---------------------------
+      # Tag builds: publish the binaries to the private artifact bucket.
+      # Identity: GitHub OIDC -> Workload Identity Federation -> sa-bl-artifact-uploader,
+      # which holds roles/storage.objectCreator only (write-once: cannot read,
+      # delete or overwrite). Bucket retention prevents replacement by anyone else.
+      # ---------------------------
+      - name: Authenticate to Google Cloud (uploader)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.UPLOADER_SA }}
+
+      - name: Set up gcloud
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload binaries to the private artifact bucket
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          DEST="gs://${GCS_BUCKET}/${{ github.event.repository.name }}/${GITHUB_REF_NAME}/"
+          cd _out
+          # The uploader holds objectCreator only (write-once, no read). A folder-style
+          # destination makes gcloud GET the prefix first, which is denied; copy each file
+          # to its exact object name instead.
+          for f in "${{ steps.sums.outputs.name }}".bin "${{ steps.sums.outputs.name }}".hex "${{ steps.sums.outputs.name }}".elf "${{ steps.sums.outputs.name }}".cdx.json SHA256SUMS; do
+            gcloud storage cp "$f" "${DEST}${f}"
+          done
+          echo "Uploaded to $DEST"
 
       - name: Detect release type
         id: reltype
@@ -168,7 +276,12 @@ jobs:
           echo "**Build SHA:** \`${{ steps.buildmeta.outputs.sha }}\`" >> notes.md
           echo "**Build Time:** ${{ steps.buildmeta.outputs.datetime }}" >> notes.md
           echo "**Build Config:** ${{ steps.cfg.outputs.config }}" >> notes.md
+          echo "**Trusted signing key (SHA-256 of public key):** \`${{ steps.pubkey.outputs.fingerprint }}\`" >> notes.md
+          echo "**${{ steps.sums.outputs.name }}.bin SHA-256:** \`${{ steps.sums.outputs.bin_sha256 }}\`" >> notes.md
+          echo "**Binaries:** \`gs://${GCS_BUCKET}/${{ github.event.repository.name }}/${GITHUB_REF_NAME}/\` (private; access via Openwater Google Cloud)" >> notes.md
 
+      # The release carries notes and the build-time SBOM only. Binaries are in the private
+      # bucket (plan D7); the firmware CI fetches them with its own federated identity.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -180,5 +293,4 @@ jobs:
           overwrite_files: true
           make_latest: ${{ steps.reltype.outputs.prerelease == 'false' }}
           files: |
-            build/${{ steps.cfg.outputs.config }}/*.hex
-            build/${{ steps.cfg.outputs.config }}/*.bin
+            _out/${{ steps.sums.outputs.name }}.cdx.json

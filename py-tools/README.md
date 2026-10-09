@@ -21,9 +21,11 @@ Application **runs from**: `0x08020400` (slot + `SFU_IMG_IMAGE_OFFSET`)
 | Ninja | any | |
 | arm-none-eabi-gcc | 13.3.1 | tested |
 | OpenOCD | any | flash bootloader via ST-Link |
-| dfu-util | ≥ 0.9 | install application via USB DFU (option A) |
-| Python | ≥ 3.9 | key generation, signing, pure-Python DFU flasher |
-| pyusb | ≥ 1.3 | only for the pure-Python flasher (`flash_firmware.py`) |
+| Python | ≥ 3.9 | key generation, signing, USB DFU flasher |
+| pyusb | ≥ 1.3 | USB backend for the flasher (`flash_firmware.py`) |
+
+> Application images are installed with the repo's own `flash_firmware.py`.
+> Neither `dfu-util` nor the STM32CubeProgrammer CLI is used or required.
 
 ---
 
@@ -45,24 +47,51 @@ pip install -r requirements.txt   # cryptography, pyusb
 
 ---
 
-## 2. Generate keys  *(once per device family)*
+## 2. Keys
+
+### Production: Google Cloud KMS
+
+The production signing key for each product is an ECDSA P-256 key in Google
+Cloud KMS (project `openwater-cloud`, key ring `openmotion-firmware`,
+`us-central1`, HSM protection level, non-exportable). Nobody holds the private
+key; CI signs through Workload Identity Federation. Only the public half is
+needed here, committed as `py-tools/keys/ecdsa_public.pem`:
 
 ```sh
-# From repo root, with the .venv active:
+# needs roles/cloudkms.publicKeyViewer and:  gcloud auth application-default login
+python py-tools/export_public_key.py \
+    --kms-key projects/openwater-cloud/locations/us-central1/keyRings/openmotion-firmware/cryptoKeys/<product>-fw-signing/cryptoKeyVersions/<n>
+# or only confirm that the committed PEM matches the KMS key:
+python py-tools/export_public_key.py --kms-key ... --check
+```
+
+Replacing the committed public key is a coordinated bootloader release: every
+unit must receive the new bootloader before firmware signed with the new key
+boots on it. Setup, rotation and audit: `OpenwaterHealth/OpenWater-KMS` repository, `docs/RUNBOOK-kms-signing-setup.md`.
+
+### Local test keys (Debug / bench only)
+
+```sh
 python py-tools/generate_keys.py          # add --force to overwrite existing keys
 ```
 
-What it does:
-- Generates an **ECDSA P-256** key pair and a **16-byte AES-128** key.
-- Writes to `py-tools/keys/`:
-  - `ecdsa_private.pem` — **keep secret, never commit**
-  - `ecdsa_public.pem`, `pub_key_x.bin`, `pub_key_y.bin`
-  - `aes128.bin` — **keep secret, never commit**
-- Rewrites `SECoreBin/Startup/se_key.s` with the public key + AES key embedded
-  as ARM MOVW/MOVT instructions (commit this file).
+- Generates an **ECDSA P-256** key pair and a **16-byte AES-128** key into
+  `py-tools/keys/`: `ecdsa_private.pem` and `aes128.bin` (**never commit**),
+  `ecdsa_public.pem`, `pub_key_x.bin`, `pub_key_y.bin`.
+- Rewrites `SECoreBin/Startup/se_key.s` (`.gitignore`d) with the public key and
+  AES key embedded as ARM MOVW/MOVT instructions.
 
-> Regenerating keys invalidates all previously signed firmware. **Rebuild the
-> bootloader (step 3)** afterwards so the new public key is embedded in SECoreBin.
+A bootloader built from local test keys accepts only images signed with that
+test private key. **Do not commit a test `ecdsa_public.pem`**: CI builds
+SECoreBin from the committed PEM, and a test key there ships a bootloader that
+rejects every production image.
+
+### AES key
+
+SECoreBin embeds an AES-128 key because the selected crypto scheme
+(`SECBOOT_ECCDSA_WITH_AES128_CBC_SHA256`) defines one, but slot images are
+stored in clear and authenticated by signature, so the AES key protects nothing
+and is not needed to sign. CI takes it from the `SECOREBIN_AES_KEY` secret.
 
 ---
 
@@ -99,7 +128,7 @@ bootloader boots, finds no valid firmware, and **enters USB DFU download mode**
 (LED blinks, `0483:df11` enumerates). Confirm:
 
 ```sh
-dfu-util -l        # or:  python py-tools/flash_firmware.py list
+python py-tools/flash_firmware.py list
 ```
 
 UART4 (PD1 TX / PD0 RX, 115200 8N1) shows:
@@ -151,21 +180,33 @@ arm-none-eabi-objdump -h build/Debug/your_app.elf | grep isr_vector
 
 ## 6. Sign the application
 
+Production (CI, Google Cloud KMS; needs `roles/cloudkms.signerVerifier`):
+
+```sh
+python py-tools/sign_firmware.py \
+    --firmware path/to/your_app.bin \
+    --kms-key  projects/openwater-cloud/locations/us-central1/keyRings/openmotion-firmware/cryptoKeys/<product>-fw-signing/cryptoKeyVersions/<n> \
+    --version  1.0.0 \
+    --output   your_app_signed.bin
+```
+
+Bench (Debug bootloader built from local test keys):
+
 ```sh
 python py-tools/sign_firmware.py \
     --firmware    path/to/your_app.bin \
     --private-key py-tools/keys/ecdsa_private.pem \
-    --aes-key     py-tools/keys/aes128.bin \
-    --version     1 \
+    --version     1.0.0 \
     --output      your_app_signed.bin
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--firmware` | *(required)* | Raw `.bin` built for `0x08020400` (step 5) |
-| `--private-key` | `py-tools/keys/ecdsa_private.pem` | ECDSA P-256 private key |
-| `--aes-key` | `py-tools/keys/aes128.bin` | Raw 16-byte AES-128 key |
-| `--version` | `1` | 16-bit firmware version (1–65535) for anti-rollback — see [Firmware versioning & anti-rollback](#firmware-versioning--anti-rollback) |
+| `--kms-key` | — | Google Cloud KMS crypto key **version** resource name; uses Application Default Credentials. Mutually exclusive with `--private-key` |
+| `--private-key` | `py-tools/keys/ecdsa_private.pem` | Local ECDSA P-256 private key (test keys only) |
+| `--aes-key` | — | Optional and unused for signing (the body is stored in clear); accepted for compatibility |
+| `--version` | `0.0.1` | Firmware version, dotted semver `MAJOR.MINOR.PATCH`, encoded as `major*10000 + minor*100 + patch` (a raw uint16 is also accepted) — see [Firmware versioning & anti-rollback](#firmware-versioning--anti-rollback) |
 | `--output` | `<firmware>_signed.bin` | Output path |
 
 ### Signed-image layout (what gets flashed to the slot)
@@ -186,37 +227,42 @@ Offset 0x400 [FwSize] Firmware body  (CLEAR — see note)
 ### Firmware versioning & anti-rollback
 
 The signed header carries a **16-bit `FwVersion`** (offset `0x006`, inside the
-ECDSA-signed region). `--version` sets it as a raw integer (1–65535); because it
-is signed, it cannot be altered without re-signing.
+ECDSA-signed region). `--version` sets it; because it is signed, it cannot be
+altered without re-signing.
 
-**Encoding convention — `MMmmpp`.** Encode the release semantic version as a
-single integer:
+**Encoding — decimal (`FwVersion = major*10000 + minor*100 + patch`).**
+`sign_firmware.py` encodes a dotted `MAJOR.MINOR.PATCH` argument as a plain
+decimal number, the same scheme the firmware release workflows use:
 
-```
-FwVersion = major*10000 + minor*100 + patch
-```
+| Semver | `--version` | FwVersion |
+|--------|-------------|-----------|
+| 0.0.1  | `0.0.1` | 1 |
+| 1.0.0  | `1.0.0` | 10000 |
+| 1.8.1  | `1.8.1` | 10801 (`0x2A31`) |
+| 1.8.2  | `1.8.2` | 10802 (`0x2A32`) |
+| 6.55.35 | `6.55.35` | 65535 (`0xFFFF`, the maximum) |
 
-| Semver | `--version` |
-|--------|-------------|
-| 1.0.0  | `10000` |
-| 1.8.0  | `10800` |
-| 1.9.3  | `10903` |
-| 2.0.0  | `20000` |
+`minor` and `patch` are limited to 0–99, so the integer orders exactly like
+`(major, minor, patch)` and the bootloader's anti-rollback compare is a plain
+unsigned `<`. The 16-bit field caps the range at `6.55.35`. **`0.0.0` is
+invalid** (encodes to `0`, which SBSFU reserves for "no firmware"); the minimum
+valid release is `0.0.1`. Pre-release suffixes are **not** encoded —
+`1.8.2-rc.1`, `1.8.2-dev.4` and `1.8.2` all map to `10802`.
 
-This keeps the integer **monotonic** with semver ordering. Limits: `minor` and
-`patch` are each `0–99`, and `major ≤ 6` (the packed value must fit 16 bits,
-`≤ 65535`). Pre-release suffixes are **not** encoded — `1.8.0-rc.1`, `1.8.0-dev.2`
-and `1.8.0` all map to `10800`.
+> **Do not change this encoding.** Fielded units store their anti-rollback floor
+> in it; an image signed under any other scheme compares below the floor and is
+> refused as a downgrade (the bootloader then erases it). Changing it is a
+> coordinated image-format change (see rule 8 in the repository `CLAUDE.md`).
 
-The release/CI build derives it from the git tag, e.g.:
+The release/CI build passes the git tag directly:
 
 ```sh
-VER="${TAG%%-*}"                          # 1.8.0-rc.1 -> 1.8.0
-IFS=. read -r MAJ MIN PAT <<< "$VER"
-FWVER=$(( MAJ*10000 + MIN*100 + PAT ))     # -> 10800
-python py-tools/sign_firmware.py --firmware app.bin --version "$FWVER" --output app_signed.bin
+VER="${TAG%%-*}"                          # 1.8.2-rc.1 -> 1.8.2
+python py-tools/sign_firmware.py --firmware app.bin --version "$VER" --output app_signed.bin
 ```
 
+> A raw integer (decimal or `0x`-prefixed hex) in `1..65535` is also accepted
+> by `--version` for advanced use.
 **Anti-rollback (downgrade protection).** The bootloader keeps a persistent,
 monotonic **version floor** — the highest `FwVersion` it has ever launched —
 stored in a flash sector that the DFU update path cannot erase. After verifying
@@ -249,15 +295,25 @@ re-enter DFU on a programmed device, erase the slot header and reset, or just
 flash a new image which replaces the old one). The image is written to
 `0x08020000`; the device then resets, verifies the signature, and boots the app.
 
-### Option A — dfu-util
+### Check the image first
+
+There is one application slot, so a download erases the installed firmware
+before the bootloader has verified the new one. An image it rejects at boot
+leaves the device in DFU mode with no application until a good image is
+flashed. Run the same checks on the file beforehand, while the installed
+firmware is still intact:
 
 ```sh
-dfu-util -D your_app_signed.bin -a 0 -s 0x08020000:leave
+python py-tools/verify_firmware.py your_app_signed.bin
+python py-tools/verify_firmware.py your_app_signed.bin --min-version 1.8.1   # also refuse a downgrade
 ```
-*(The `Error during download get_status` after `:leave` is benign — the device
-detaches/resets immediately. `Invalid DFU suffix` is also expected.)*
 
-### Option B — pure-Python flasher (no dfu-util)
+It needs only the public key (`keys/ecdsa_public.pem` by default; pass
+`--public-key` for a bootloader built with local test keys) and checks the
+header signature, `FwTag`, size and trailing data. `flash_firmware.py` runs
+it automatically before touching the device.
+
+### Install over USB DFU (`flash_firmware.py`)
 
 ```sh
 python py-tools/flash_firmware.py your_app_signed.bin
@@ -271,15 +327,25 @@ python py-tools/flash_firmware.py leave                # reset device into the a
 
 `flash_firmware.py` uses `stm32dfu.py` (pure-Python DfuSe over pyusb). It
 auto-detects the device's DFU transfer size, erases the affected slot sector(s),
-writes the image to `0x08020000`, and resets — the equivalent of the dfu-util
-command above.
+writes the image to `0x08020000`, and resets.
+
+Before erasing anything it verifies the image (see "Check the image first") and
+reads the installed version from the slot header, and stops if the image would
+be rejected or is a downgrade. `--allow-unverified` skips this for bench
+negative-path tests only; the bootloader's own verification is unaffected.
 
 > **Windows / pyusb driver:** the "STM32 BOOTLOADER" device must be bound to a
 > WinUSB/libusb driver (use [Zadig](https://zadig.akeo.ie/)), or `stm32dfu.py`
 > will fall back to the libusb-1.0.dll bundled with STM32CubeProgrammer (see
-> `_CUBEPROG_LIBUSB_PATHS` in `stm32dfu.py`).
+> `_CUBEPROG_LIBUSB_PATHS` in `stm32dfu.py`). Only the DLL is borrowed; the
+> CubeProgrammer CLI itself is not used.
 
-### Option C — direct ST-Link (no DFU)
+> The bootloader speaks standard DfuSe (AN3156), so generic tools such as
+> `dfu-util` can talk to it, but they are not part of this workflow: they skip
+> the host-side image check above, so a bad image erases the installed
+> firmware before it is refused at boot.
+
+### Alternative — direct ST-Link (no DFU)
 
 ```sh
 openocd -f interface/stlink.cfg -f target/stm32h7x.cfg \
@@ -320,6 +386,47 @@ It is reported in two places:
 
 ---
 
+## 8. Migrating fielded sensor modules to bootloader 1.2.0
+
+Units in the field run bootloader **1.1.0** (RDP 0, old signing key). Bootloader 1.2.0
+trusts only the Google Cloud KMS key, so a unit must get the new bootloader before any
+clinical image will run on it. `flash_firmware.py migrate` does the whole sequence over
+USB, no case opening (the sensor's command channel is bulk USB on interface 0 of 0483:5A5A;
+`--product sensor` forces it, `--app-serial` picks one module when several are attached):
+
+```sh
+# inputs come from the private bucket gs://openwater-firmware-artifacts
+#   open-motion-sensor-bl-updater/<tag>/open-motion-sensor-bl-updater-<tag>-bl<bl>-signed.bin
+#   openmotion-sensor-fw/<tag>/openmotion-sensor-fw-<tag>-signed.bin
+python flash_firmware.py migrate \
+    --updater open-motion-sensor-bl-updater-1.8.98-bl1.2.0-rc.1-signed.bin \
+    --signed  openmotion-sensor-fw-<tag>-signed.bin --product sensor --yes
+```
+
+What happens, by starting state (the tool detects it):
+
+| Found | Steps |
+|---|---|
+| sensor application on USB (0483:5A5A) | `OW_CMD_DFU` over bulk interface 0, then as below |
+| DFU, bootloader `1.0.x`/`1.1.x` | erase the slot, flash the **updater** (old key). The updater rewrites sector 0 with bootloader 1.2.0, erases the slot and the shared floor sector and resets into its DFU; the tool waits for it, checks `version` is `1.2.x`, then flashes the **signed application** (new key). |
+| DFU, bootloader `1.2.x` | flash the signed application only |
+| DFU, STM32 ROM loader (bare-metal module) | needs `--production <bootloader+app>`: erase sectors 0-5, write it at `0x08000000`. The ROM's jump into the new image hangs on sensor modules (known quirk): the tool tells you to power-cycle the unit and then waits for the application. Verified on the bench 2026-10-08. The FPGA bitstream region (bank 2) and the stored config are not touched. |
+
+Both images are verified on the host first: the updater against `keys/ecdsa_public_legacy_1.1.0.pem`
+(what 1.0.0 and 1.1.0 trust), the application against `keys/ecdsa_public.pem`. With `--production` the
+tool also checks that the updater embeds the same bootloader the production image carries.
+
+Rules on the bench and in the field: powered, do not unplug USB, one module in DFU at a time.
+The single LED (PC14) is on while the updater runs and blinks forever if the sector-0 rewrite
+failed (SWD recovery). The updater refuses, without touching
+sector 0, if the option bytes are not in the fielded state (RDP 0, no WRP, no PCROP); the unit
+then comes back in the old bootloader's DFU.
+
+`python flash_firmware.py enter-dfu` alone puts a running module into DFU and prints the
+bootloader version and DFU flavour. Windows needs the WinUSB driver (Zadig) on the DFU
+device and on the sensor's composite device (the SDK uses the same binding). Design: `PLAN-console-migration.md`;
+updater source: `open-motion-sensor-bl-updater` (mirror of the console updater).
+
 ## Flash memory map
 
 Defined in `Core/Inc/memory_map.h` (single source of truth). 2 MB flash, 16 × 128 KB sectors:
@@ -354,19 +461,22 @@ Addr range              Size   Sct   Region            DFU access
 
 ```
 py-tools/
-  generate_keys.py     Generate ECC P-256 + AES-128 keys, update se_key.s
+  generate_keys.py     Generate LOCAL TEST ECC P-256 + AES-128 keys, update se_key.s
+  export_public_key.py Fetch the production public key from Google Cloud KMS (or --check it)
   gen_se_key_s.py      Low-level: raw key bytes -> ARM MOVW/MOVT asm
-  sign_firmware.py     Sign + format an application image for the active slot
+  sign_firmware.py     Sign + format an application image (--kms-key or local --private-key)
+  verify_firmware.py   Check a signed image on the host before flashing it
   flash_firmware.py    Pure-Python USB DFU installer (uses stm32dfu.py)
   stm32dfu.py          Pure-Python STM32 DfuSe protocol (pyusb)
-  requirements.txt     cryptography, pyusb
+  requirements.txt     cryptography, pyusb, google-cloud-kms
   keys/
-    ecdsa_private.pem  PRIVATE — never commit
-    ecdsa_public.pem, pub_key_x.bin, pub_key_y.bin
+    ecdsa_private.pem  local TEST key only — PRIVATE, never commit (production key is in KMS)
+    ecdsa_public.pem   committed; public half of the KMS production key
+    pub_key_x.bin, pub_key_y.bin
     aes128.bin         PRIVATE — never commit
 
 SECoreBin/Startup/
-  se_key.s             Auto-generated by generate_keys.py — commit this
+  se_key.s             Generated (generate_keys.py locally, CI from the secret) — .gitignored
 ```
 
 ---
@@ -374,7 +484,7 @@ SECoreBin/Startup/
 ## Quick reference
 
 ```sh
-# one-time
+# one-time, bench only: LOCAL TEST keys (the production public key comes from KMS, see §2)
 python py-tools/generate_keys.py
 cmake --preset Debug && cmake --build build/Debug --target all -j 10
 openocd -f interface/stlink.cfg -f target/stm32h7x.cfg \
@@ -383,5 +493,5 @@ openocd -f interface/stlink.cfg -f target/stm32h7x.cfg \
 # per application build
 #   (1) link app at 0x08020400 + VTOR 0x08020400, then build your_app.bin
 python py-tools/sign_firmware.py --firmware your_app.bin --version 1 --output your_app_signed.bin
-python py-tools/flash_firmware.py your_app_signed.bin        # or: dfu-util -D your_app_signed.bin -a 0 -s 0x08020000:leave
+python py-tools/flash_firmware.py your_app_signed.bin
 ```

@@ -69,3 +69,6 @@ SECoreBin/Binary/iv.bin
 # Generated from the AES + ECDSA public key material (embeds the AES secret);
 # regenerate locally with py-tools/generate_keys.py — never commit.
 SECoreBin/Startup/se_key.s 
+
+# Generated at build time by scripts/gen_sbom.py (never commit)
+sbom.cdx.json
