@@ -106,6 +106,7 @@ T_DFU_APPEAR     = 20.0               # app -> bootloader DFU after OW_CMD_DFU
 T_UPDATER_CYCLE  = 150.0              # 1.0.0 verifies updater, updater rewrites sector 0, 1.2.0 first boot applies
                                       # option bytes (reset) and enumerates DFU
 T_APP_APPEAR     = 90.0               # bootloader verifies the app, launches it, CDC enumerates
+T_POWER_CYCLE    = 300.0              # ROM path on a sensor module: operator power-cycles the unit by hand
 
 _VER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
 
@@ -321,6 +322,15 @@ def cmd_migrate(args):
 
     _say(f"\nWaiting for the application (up to {T_APP_APPEAR:.0f}s)...")
     kind, handle = _wait_app(args.product, T_APP_APPEAR, getattr(args, "app_serial", None))
+    if kind is None and mode == "rom" and not STM32DFU.wait_for_device(0.5, present=True, serial=args.serial):
+        # Flash is complete, but the unit is gone from USB: the STM32 ROM loader's jump into
+        # a freshly written image hangs on the sensor modules until a real power cycle
+        # (openmotion-sensor-fw CLAUDE.md "jump-to-app hang"; seen on the bench 2026-10-08).
+        _say("  The unit left USB without re-enumerating. The image is written; the ROM loader's jump\n"
+             "  into it is known to hang on sensor modules. POWER-CYCLE THE UNIT NOW (console power\n"
+             "  cycles both sensors). The new bootloader then starts cold and launches the application.")
+        _say(f"  waiting for the application after the power cycle (up to {T_POWER_CYCLE:.0f}s)...")
+        kind, handle = _wait_app(args.product, T_POWER_CYCLE, getattr(args, "app_serial", None))
     if kind is None:
         raise SystemExit("Error: the application did not enumerate. Check UART4; a DFU device still present "
                          "means the bootloader refused the image.")

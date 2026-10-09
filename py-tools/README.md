@@ -410,7 +410,7 @@ What happens, by starting state (the tool detects it):
 | sensor application on USB (0483:5A5A) | `OW_CMD_DFU` over bulk interface 0, then as below |
 | DFU, bootloader `1.0.x`/`1.1.x` | erase the slot, flash the **updater** (old key). The updater rewrites sector 0 with bootloader 1.2.0, erases the slot and the shared floor sector and resets into its DFU; the tool waits for it, checks `version` is `1.2.x`, then flashes the **signed application** (new key). |
 | DFU, bootloader `1.2.x` | flash the signed application only |
-| DFU, STM32 ROM loader (bare-metal unit) | needs `--production <bootloader+app>`: erase sectors 0-5, write it at `0x08000000`, leave DFU. Not yet exercised on hardware. |
+| DFU, STM32 ROM loader (bare-metal module) | needs `--production <bootloader+app>`: erase sectors 0-5, write it at `0x08000000`. The ROM's jump into the new image hangs on sensor modules (known quirk): the tool tells you to power-cycle the unit and then waits for the application. Verified on the bench 2026-10-08. The FPGA bitstream region (bank 2) and the stored config are not touched. |
 
 Both images are verified on the host first: the updater against `keys/ecdsa_public_legacy_1.1.0.pem`
 (what 1.0.0 and 1.1.0 trust), the application against `keys/ecdsa_public.pem`. With `--production` the
