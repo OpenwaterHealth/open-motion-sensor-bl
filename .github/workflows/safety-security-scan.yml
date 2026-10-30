@@ -5,6 +5,14 @@ on:
     branches: [ main, next ]
   pull_request:
     branches: [ main ]
+  # Nightly scan (DC-00096 section 5.2): re-checks the SBOM against newly published
+  # advisories even when no source has changed. GitHub runs schedules only from the
+  # default branch (main), so the scheduled run checks out next explicitly below.
+  # 06:17 UTC = 02:17 EDT / 01:17 EST, off the top of the hour.
+  schedule:
+    - cron: "17 6 * * *"
+  # Manual run (Actions tab, "Run workflow") to test the scan on any branch.
+  workflow_dispatch:
 
 jobs:
   static-analysis:
@@ -12,6 +20,20 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          # Scheduled runs scan next; push, pull request and manual runs scan their own ref.
+          ref: ${{ github.event_name == 'schedule' && 'next' || '' }}
+
+      # The scanned commit, for the evidence record: on a scheduled run github.sha is
+      # main's head, not the commit that was checked out and scanned.
+      - name: Record scanned commit
+        run: |
+          {
+            echo "event: ${{ github.event_name }}"
+            echo "ref: $(git rev-parse --abbrev-ref HEAD)"
+            echo "commit: $(git rev-parse HEAD)"
+            echo "scanned_at_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee scanned-commit.txt
 
       - name: Install Analysis Tools
         run: |
@@ -93,7 +115,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-compliance-report
+          name: firmware-compliance-report-${{ github.event_name }}-${{ github.run_number }}
           path: |
+            scanned-commit.txt
             sbom.cdx.json
             ${{ steps.grype.outputs.sarif }}
