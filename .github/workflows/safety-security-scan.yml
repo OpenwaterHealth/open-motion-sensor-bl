@@ -16,7 +16,10 @@ on:
 
 jobs:
   static-analysis:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04 (2026-11-06), whose apt cppcheck (2.19)
+    # replaced the 2.13 this scan was validated with and failed every nightly since.
+    # Pinning keeps the analyzer version from changing under the regulatory scan.
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -43,6 +46,9 @@ jobs:
 
       # 1. Cppcheck with MISRA-C:2012 and Safety focus
       # --error-exitcode=1 ensures the build fails on findings
+      # __ALIGN_BEGIN/__ALIGN_END are the ST USB library's alignment macros (usbd_def.h,
+      # not on the include path); without them cppcheck >= 2.19 stops with unknownMacro
+      # on usbd_desc.c.
       - name: Run Cppcheck (Safety & Standards)
         run: |
           cppcheck --enable=warning,style,performance,portability \
@@ -50,7 +56,7 @@ jobs:
                    --error-exitcode=1 \
                    --force \
                    --inline-suppr \
-                   --std=c11 \
+                   -D__ALIGN_BEGIN= -D__ALIGN_END= \
                    --template="[{severity}] {file}:{line} {id} - {message}" \
                    --suppress=missingIncludeSystem \
                    --suppress=*:Core/Src/lwrb.c \
